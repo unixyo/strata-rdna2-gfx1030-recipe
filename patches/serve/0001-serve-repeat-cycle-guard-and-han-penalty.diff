@@ -1,0 +1,536 @@
+diff --git a/serve/server.py b/serve/server.py
+index a0fb2b88c..2e4d0b777 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -144,6 +144,11 @@ VISION_START = "<|vision_start|>"
+ # sets it; 0 turns it off.
+ REPEAT_STOP_TOKENS = 256
+ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
++# A short multi-token cycle can evade the single-token guard indefinitely. End a reply once its exact token suffix
++# consists only of the same <=64-token block repeated >=8 times over at least this many tokens.
++REPEAT_CYCLE_STOP_TOKENS = 256
++REPEAT_CYCLE_MAX_PERIOD = 64
++REPEAT_CYCLE_MIN_REPEATS = 8
+ # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+ # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
+ # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+@@ -161,6 +166,23 @@ LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checke
+ LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
+ 
+ 
++def repeated_token_cycle(ids, min_span=REPEAT_CYCLE_STOP_TOKENS):
++    """Return (period, repeats, span) for a pathological exact suffix cycle, else None."""
++    if not min_span or len(ids) < min_span:
++        return None
++    upto = min(REPEAT_CYCLE_MAX_PERIOD, len(ids) // REPEAT_CYCLE_MIN_REPEATS)
++    for period in range(1, upto + 1):
++        repeats = max(REPEAT_CYCLE_MIN_REPEATS, (min_span + period - 1) // period)
++        span = period * repeats
++        if len(ids) < span:
++            continue
++        block = ids[-period:]
++        if all(ids[-r * period:-(r - 1) * period if r > 1 else None] == block
++               for r in range(2, repeats + 1)):
++            return period, repeats, span
++    return None
++
++
+ def reasoning_repeat_coverage(text):
+     """Coverage of recent words by 12-word passages seen at least three times.
+ 
+@@ -218,6 +240,8 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
+ # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
+ # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
+ ENGINE_SILENCE_S = 300.0
++# Diagnostic only: warn once after this much engine silence without changing or ending the request.
++ENGINE_STALL_WARN_S = 30.0
+ # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
+ # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
+ SESSION_WAIT_MAX_S = 3600
+@@ -590,6 +614,7 @@ class StrataEngine:
+     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
+     """
+     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
++    stall_warn_s = ENGINE_STALL_WARN_S   # diagnostic only; never changes or ends a request
+     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
+     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+@@ -973,6 +998,9 @@ class StrataEngine:
+         pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
+         pp = sampling.get("presence_penalty")
+         pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
++        hp = sampling.get("han_penalty")
++        if isinstance(hp, (int, float)) and not isinstance(hp, bool) and float(hp) > 0.0:
++            keys += f" han_penalty={float(hp)!r}"
+         if rp_on:
+             keys += f" penalty_repeat={float(rp)!r}"
+         if pf_on:
+@@ -1589,11 +1617,24 @@ class StrataEngine:
+         beat = heard
+         stall_s = ENGINE_STALL_S or 0.0
+         stall_state: dict = {}
++        generated, phase, last_event, stall_warned = 0, "prefill", "GEN", False
+         try:
+             while True:
+                 wait = 10.0
++                silent_for = time.monotonic() - heard
++                warn_after = float(getattr(self, "stall_warn_s", 0) or 0)
++                if warn_after > 0 and not stall_warned:
++                    warn_left = warn_after - silent_for
++                    if warn_left <= 0:
++                        pid = getattr(self.proc, "pid", "?")
++                        print(f"[strata] WARNING: engine stall: silent={silent_for:.0f}s phase={phase} "
++                              f"generated={generated} last_event={last_event} prompt_read={read_to} pid={pid}",
++                              flush=True)
++                        stall_warned = True
++                    else:
++                        wait = min(wait, warn_left)
+                 if allow > 0:
+-                    wait = min(wait, allow - (time.monotonic() - heard))
++                    wait = min(wait, allow - silent_for)
+                     if wait <= 0:
+                         done = True                       # no STOP and no drain: nothing is listening
+                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
+@@ -1609,7 +1650,15 @@ class StrataEngine:
+                         except EngineSilent:
+                             done = True                   # as above: nothing is listening
+                             raise
+-                    if allow > 0 and time.monotonic() - heard >= allow:
++                    silent_for = time.monotonic() - heard
++                    warn_after = float(getattr(self, "stall_warn_s", 0) or 0)
++                    if warn_after > 0 and not stall_warned and silent_for >= warn_after:
++                        pid = getattr(self.proc, "pid", "?")
++                        print(f"[strata] WARNING: engine stall: silent={silent_for:.0f}s phase={phase} "
++                              f"generated={generated} last_event={last_event} prompt_read={read_to} pid={pid}",
++                              flush=True)
++                        stall_warned = True
++                    if allow > 0 and silent_for >= allow:
+                         continue                          # enforce the expired deadline before another heartbeat
+                     if time.monotonic() - beat >= 10.0:
+                         beat = time.monotonic()
+@@ -1622,12 +1671,16 @@ class StrataEngine:
+                 beat = heard
+                 if stall_state:
+                     stall_state.clear()
++                stall_warned = False
+                 if line.startswith("T "):
+                     allow = silence
++                    generated += 1
++                    phase, last_event = "decode", "T"
+                     if cancel.is_set():
+                         return
+                     yield int(line[2:])
+                 elif line.startswith("PP "):
++                    phase, last_event = "prefill", "PP"
+                     f = line.split()
+                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+@@ -1641,11 +1694,13 @@ class StrataEngine:
+                         return                            # would send no keep-alives at all)
+                     yield None
+                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
++                    last_event = "RESUME"
+                     try:
+                         read_to = self.reused = int(line.split()[1])
+                     except (IndexError, ValueError):
+                         pass
+                 elif line.startswith("DONE"):
++                    last_event = "DONE"
+                     self._parse_done(line)
+                     done = True
+                     return
+@@ -2790,6 +2845,8 @@ class Service:
+         self.reasoning_loop_recovery = False
+         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
++        self.repeat_cycle_stop_tokens = REPEAT_CYCLE_STOP_TOKENS
++        self.recycle_engine_on_repeat = False
+         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+@@ -2798,6 +2855,30 @@ class Service:
+     def loaded(self) -> bool:
+         return not hasattr(self.engine, "alive") or self.engine.alive()
+ 
++    def _recycle_repeated_engine(self, reason: str) -> bool:
++        """Retire a resident engine after a pathological repeat, leaving the API server alive."""
++        if not self.recycle_engine_on_repeat:
++            return False
++        engine = self.engine
++        if getattr(engine, "batch", 0):
++            print(f"[strata] repeat guard: {reason}; not recycling a parallel engine while other slots may be live",
++                  flush=True)
++            return False
++        if not (hasattr(engine, "close") and hasattr(engine, "restart")):
++            return False
++        print(f"[strata] repeat guard: {reason}; retiring the engine process so the next request starts fresh",
++              flush=True)
++        try:
++            engine.close()
++        except EngineStuck as e:
++            if hasattr(engine, "ended"):
++                engine.ended = True
++            print(f"[strata] repeat guard: engine retirement did not finish ({e}); the next request will retry it",
++                  flush=True)
++            return False
++        print("[strata] repeat guard: engine process retired; the Python API server stays up", flush=True)
++        return True
++
+     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
+         to or from a file in slot_save_path.  -> (HTTP status, body)."""
+@@ -3653,6 +3734,7 @@ class Service:
+         timings, before = None, None                    # this request's timings; the engine's `last` before it
+         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
+         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
++        repeated_cycle = None                                   # exact short token cycle, reasoning or final
+         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
+@@ -3774,6 +3856,11 @@ class Service:
+                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                                     repeated = True     # #606: a degenerate output, not an answer: end it here
+                                     break
++                                if (self.repeat_cycle_stop_tokens and n % 32 == 0 and
++                                        n >= self.repeat_cycle_stop_tokens):
++                                    repeated_cycle = repeated_token_cycle(raw_ids, self.repeat_cycle_stop_tokens)
++                                    if repeated_cycle is not None:
++                                        break
+                                 piece = detok.push(t)
+                                 tail = (tail + piece)[-2:]
+                                 evs = cut(parser.feed(piece))
+@@ -3926,6 +4013,11 @@ class Service:
+                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
+                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+                               "same, restart the server and report it (#606)", flush=True)
++                    elif repeated_cycle is not None:
++                        period, repeats, span = repeated_cycle
++                        print(f"[strata] the reply repeated an exact token cycle: period={period} tokens, "
++                              f"repeats>={repeats}, span={span} tokens at output token {n}; ended as \"length\" "
++                              "(repeat_cycle_stop_tokens; 0 turns this off)", flush=True)
+                 except GeneratorExit:                   # the client disconnected mid-stream
+                     finish = "disconnect"
+                     raise
+@@ -4006,6 +4098,11 @@ class Service:
+                                 self.status.update(busy=False)
+                                 self.status.pop("tail", None)
+                                 self.status.pop("tool", None)
++                    repeat_reason = ("reasoning passage repetition" if looped else
++                                     "single-token repetition" if repeated else
++                                     "exact token-cycle repetition" if repeated_cycle is not None else None)
++                    if repeat_reason is not None:
++                        self._recycle_repeated_engine(repeat_reason)
+         finally:
+             if emb:
+                 Path(emb).unlink(missing_ok=True)
+@@ -4908,6 +5005,15 @@ def make_handler(svc: Service):
+                 req = json.loads(self._body() or b"{}")
+                 if not isinstance(req, dict):
+                     raise ValueError("send a JSON object")
++                hp_header = self.headers.get("X-Strata-Han-Penalty")
++                if hp_header is not None:
++                    try:
++                        hp = float(hp_header)
++                    except ValueError:
++                        raise ValueError("X-Strata-Han-Penalty must be a number from 0 to 20")
++                    if not 0.0 <= hp <= 20.0:
++                        raise ValueError("X-Strata-Han-Penalty must be a number from 0 to 20")
++                    req["han_penalty"] = hp
+                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
+                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
+                                                          "whole conversation to POST /v1/responses", code="not_found"))
+@@ -5024,7 +5130,7 @@ def make_handler(svc: Service):
+             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
+             params = {names.get(k, k): v for k, v in defaults.items()
+                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
+-                               "presence_penalty", "frequency_penalty", "penalty_last_n")}
++                               "presence_penalty", "frequency_penalty", "penalty_last_n", "han_penalty")}
+             params["n_predict"] = svc.shared.get("max_tokens", -1)
+             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
+                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
+@@ -5871,7 +5977,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
+     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
+     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
+     presence_penalty, repetition_penalty (also written repeat_penalty), frequency_penalty, penalty_last_n (also
+-    repeat_last_n), seed.  The request's own fields
++    repeat_last_n), han_penalty, seed.  The request's own fields
+     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
+     are named at startup and ignored."""
+@@ -5911,6 +6017,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
+             if not number or value < 0:
+                 raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+             out[key] = float(value)
++        elif key == "han_penalty":
++            if not number or not 0 <= value <= 20:
++                raise SystemExit(f"[strata] config sampling.han_penalty={value!r}: expected a number from 0 to 20")
++            out[key] = float(value)
+         elif key == "repetition_penalty":
+             if not number or value <= 0:
+                 raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+@@ -6233,6 +6343,15 @@ def main() -> int:
+     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
+         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+     svc.repeat_stop_tokens = rs
++    rcs = cfg.get("repeat_cycle_stop_tokens", REPEAT_CYCLE_STOP_TOKENS)
++    if isinstance(rcs, bool) or not isinstance(rcs, int) or rcs < 0:
++        raise SystemExit(f"[strata] config \"repeat_cycle_stop_tokens\" must be a whole number >= 0 "
++                         f"(0 = off), not {rcs!r}")
++    svc.repeat_cycle_stop_tokens = rcs
++    recycle_repeat = cfg.get("recycle_engine_on_repeat", False)
++    if not isinstance(recycle_repeat, bool):
++        raise SystemExit(f"[strata] config \"recycle_engine_on_repeat\" must be true or false, not {recycle_repeat!r}")
++    svc.recycle_engine_on_repeat = recycle_repeat
+     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
+         try:
+diff --git a/serve/test_reasoning_loop_recovery.py b/serve/test_reasoning_loop_recovery.py
+index b53ee56ac..c172ec852 100644
+--- a/serve/test_reasoning_loop_recovery.py
++++ b/serve/test_reasoning_loop_recovery.py
+@@ -58,6 +58,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+         engine = RecordingEngine(self.tok, [self.loop,
+             'I have verified the solution.\n</think>\nComplete solution.'])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = enabled
+         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
+         return engine, events
+@@ -66,6 +67,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+         engine = RecordingEngine(self.tok, [self.loop,
+             'Verified.\n</think>\nComplete solution.'])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         request = {'temperature': .2, 'presence_penalty': 0, 'top_p': .95, 'top_k': 64, 'seed': 2}
+         list(service.run(self.ids, True, [], 40000, request, threading.Event()))
+@@ -81,6 +83,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_frozen_cohort_sampler_is_unchanged_during_recovery(self):
+         engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nComplete solution.'])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         sampler = {'temperature': 1.0, 'top_p': .95, 'top_k': 20, 'presence_penalty': 1.5, 'seed': 2}
+         list(service.run(self.ids, True, [], 40000, sampler, threading.Event()))
+@@ -91,6 +94,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
+         engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\nComplete solution.'])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = "recover"
+         list(service.run(self.ids, True, [], 40000, {'temperature': 0, 'top_p': .5, 'top_k': 5}, threading.Event()))
+         self.assertEqual((engine.sampling_calls[1]['top_p'], engine.sampling_calls[1]['top_k']), (.5, 5))
+@@ -110,6 +114,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_stop_mode_ends_the_reply_at_the_loop(self):
+         engine = RecordingEngine(self.tok, [self.loop])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = "stop"
+         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
+         self.assertEqual(len(engine.calls), 1)                   # no second pass
+@@ -136,6 +141,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_default_single_token_guard_does_not_detect_passage_loop(self):
+         engine = RecordingEngine(self.tok, [self.loop])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         events = list(service.run(self.ids, True, [], 16384, {}, threading.Event()))
+         self.assertEqual(service.repeat_stop_tokens, 256)
+         self.assertEqual(events[-1][1]['finish'], 'length')
+@@ -145,6 +151,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_recovery_is_once_and_never_extends_output_limit(self):
+         engine = RecordingEngine(self.tok, [self.loop, self.loop])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         events = list(service.run(self.ids, True, [], 16384, {}, threading.Event()))
+         self.assertEqual(len(engine.calls), 2)
+@@ -155,6 +162,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_repeated_final_text_does_not_change_sampler_or_prompt(self):
+         engine = RecordingEngine(self.tok, [self.loop])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         events = list(service.run(self.ids, False, [], 40000, {}, threading.Event()))
+         self.assertEqual(len(engine.calls), 1)
+@@ -163,6 +171,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_missing_native_high_hint_skips_recovery(self):
+         engine = RecordingEngine(self.tok, [self.loop])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n', parse_special=True)
+         events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
+@@ -172,6 +181,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+     def test_cancel_during_reasoning_does_not_start_recovery(self):
+         engine = RecordingEngine(self.tok, [self.loop, 'Unused'])
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         cancel = threading.Event()
+         events = []
+@@ -187,6 +197,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
+         engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nAnswer.'])
+         engine.batch = 2
+         service = Service(engine, self.tok, None)
++        service.repeat_cycle_stop_tokens = 0              # isolate reasoning recovery from the generic cycle guard
+         service.reasoning_loop_recovery = True
+         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
+         self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 362cfa74c..413cc7e2e 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -30,8 +30,12 @@ from types import SimpleNamespace  # noqa: E402
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ CTX = 4096
+-ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (#606: not
+-#                                                one token repeated, which the server ends at 256)
++# A deterministic, non-cyclic mock answer. The local repeat-cycle guard rightly stops
++# the old "xy" * 1000 fixture, which makes max_tokens tests report only 288 tokens.
++# Keep >4K bytes of varied ASCII so max_tokens, not repetition protection, ends it.
++from random import Random  # noqa: E402
++_mock_answer_rng = Random(20261011)
++ANSWER = "".join(_mock_answer_rng.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6000))
+ 
+ 
+ class RecordingEngine(MockEngine):
+@@ -1540,6 +1544,11 @@ class SamplingKeys(unittest.TestCase):
+         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
+         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
+ 
++    def test_han_soft_penalty(self):
++        self.assertIn("han_penalty=6.0", self.keys(temperature=1.0, han_penalty=6))
++        for off in (0, 0.0, None, True, "6"):
++            self.assertFalse([k for k in self.keys(han_penalty=off) if k.startswith("han_penalty=")], off)
++
+ 
+ class SharedPrefix(unittest.TestCase):
+     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""
+@@ -2060,11 +2069,13 @@ class LearnedProfile(unittest.TestCase):
+ class RepeatStop(unittest.TestCase):
+     """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
+ 
+-    def run_reply(self, script, limit=None):
++    def run_reply(self, script, limit=None, cycle_limit=None):
+         tok = ByteTokenizer()
+         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+         if limit is not None:
+             svc.repeat_stop_tokens = limit
++        if cycle_limit is not None:
++            svc.repeat_cycle_stop_tokens = cycle_limit
+         ids = tok.encode("hi")
+         with contextlib.redirect_stdout(io.StringIO()) as out:
+             done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+@@ -2079,12 +2090,75 @@ class RepeatStop(unittest.TestCase):
+     def test_short_runs_and_off(self):
+         done, _ = self.run_reply("=" * 255 + " fine")
+         self.assertEqual(done["finish"], "stop")
+-        done, log = self.run_reply("!" * 1000, limit=0)
++        done, log = self.run_reply("!" * 1000, limit=0, cycle_limit=0)
+         self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
+         self.assertNotIn("repeated one token", log)
+-        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
++        done, _ = self.run_reply("ab" * 400, limit=8, cycle_limit=0)  # alternating tokens are not one run
+         self.assertEqual(done["finish"], "stop")
+ 
++    def test_a_short_multi_token_cycle_is_ended_in_final_text(self):
++        done, log = self.run_reply("ab" * 1000, limit=0)
++        self.assertEqual(done["finish"], "length")
++        self.assertLessEqual(done["completion_tokens"], 288)
++        self.assertIn("exact token cycle: period=2", log)
++        self.assertIn("span=256 tokens", log)
++
++    def test_cycle_guard_does_not_stop_nonperiodic_final_text(self):
++        script = "".join(f"item {i}: value {i * i}\n" for i in range(80))
++        done, log = self.run_reply(script, limit=0)
++        self.assertEqual(done["finish"], "stop")
++        self.assertNotIn("exact token cycle", log)
++
++    def test_repeat_recycle_retires_engine_and_next_request_restarts_it(self):
++        class RecyclableMock(MockEngine):
++            def __init__(self, tokenizer, scripts):
++                super().__init__(tokenizer, scripts, max_context=CTX)
++                self.running, self.closes, self.restarts = True, 0, 0
++            def alive(self): return self.running
++            def close(self):
++                self.closes += 1
++                self.running = False
++            def restart(self):
++                self.restarts += 1
++                self.running = True
++
++        tok = ByteTokenizer()
++        engine = RecyclableMock(tok, ["ab" * 1000, "fine"])
++        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        svc.repeat_stop_tokens = 0
++        svc.recycle_engine_on_repeat = True
++        ids = tok.encode("hi")
++        with contextlib.redirect_stdout(io.StringIO()) as out:
++            first = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
++        self.assertEqual(first["finish"], "length")
++        self.assertEqual((engine.closes, engine.restarts, engine.alive()), (1, 0, False))
++        self.assertIn("engine process retired", out.getvalue())
++
++        second = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
++        self.assertEqual(second["finish"], "stop")
++        self.assertEqual((engine.closes, engine.restarts, engine.alive()), (1, 1, True))
++
++    def test_normal_answer_does_not_recycle_engine(self):
++        class RecyclableMock(MockEngine):
++            batch = 0
++            def __init__(self, tokenizer):
++                super().__init__(tokenizer, "fine", max_context=CTX)
++                self.running, self.closes = True, 0
++            def alive(self): return self.running
++            def close(self):
++                self.closes += 1
++                self.running = False
++            def restart(self): self.running = True
++
++        tok = ByteTokenizer()
++        engine = RecyclableMock(tok)
++        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        svc.recycle_engine_on_repeat = True
++        done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
++                if kind == "done"][0]
++        self.assertEqual(done["finish"], "stop")
++        self.assertEqual(engine.closes, 0)
++
+ 
+ class LayerSplit(unittest.TestCase):
+     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
+@@ -4193,6 +4267,8 @@ class SilentEngine(unittest.TestCase):
+         engine.proc.poll.return_value = None
+         engine.lines, engine.can_stop, engine.max_context = queue.Queue(), can_stop, 4096
+         engine.silence_s, engine.log_path = silence, None
++        engine.stall_warn_s = 30.0
++        engine.proc.pid = 1234
+         return engine
+ 
+     def later(self, engine, delay, *lines):
+@@ -4230,6 +4306,24 @@ class SilentEngine(unittest.TestCase):
+             engine.proc.poll.return_value = -6
+             self.assertIn("a hang it caught", engine.death_note())
+ 
++    def test_stall_warning_is_content_free_and_nonfatal(self):
++        engine = self.bare(0.3)
++        engine.stall_warn_s = 0.03
++        engine.lines.put("PP 1 1 1 100.0")
++        self.later(engine, 0.08, "T 7", "DONE 1 1 1 1 stop")
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            self.assertEqual(list(engine.generate([123], 10, {}, threading.Event())), [None, 7])
++        warning = out.getvalue()
++        self.assertEqual(warning.count("WARNING: engine stall:"), 1)
++        self.assertIn("phase=prefill", warning)
++        self.assertIn("generated=0", warning)
++        self.assertIn("last_event=PP", warning)
++        self.assertIn("prompt_read=1", warning)
++        self.assertIn("pid=1234", warning)
++        self.assertNotIn("123]", warning)
++        engine.proc.kill.assert_not_called()
++
+     def test_prompt_chunks_set_the_wait(self):
+         # a PP line every second, at 100 tok/s: far over a 0.3 s silence, but each chunk is on time for its size
+         engine = self.bare(0.3)

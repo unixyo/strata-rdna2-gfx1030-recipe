@@ -1,0 +1,7 @@
+*.gguf
+*.bin
+*.log
+*.private.json
+*.bak
+build*/
+.env
