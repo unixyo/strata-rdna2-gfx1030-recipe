@@ -10,7 +10,9 @@
 | 0004 | Provenance notes for the rocBLAS table |
 | 0005 | Backport of [Strata PR #3381](https://github.com/Niko1221/Strata/pull/3381) by @Vop3p: `STRATA_PROMPT_ATTN_RDNA2` one-block online-softmax prompt attention for gfx103x with int8 KV |
 
-The three backported changes are @Vop3p's work. On 2026-10-30 #1151 and #1167 were closed without a merge and #3381 was still open. Each patch's commit message links the original PR.
+The three backported changes are @Vop3p's work. #1151 and #1167 were closed without a merge, but the maintainer ported both into 0.1.45 (opt-in) and they are in upstream `main` from 0.2.0-beta on; on a newer engine, drop 0002-0004 and use the upstream switches. #3381 is still open (checked 2026-10-31). Each patch's commit message links the original PR.
+
+0005 only runs with int8 KV. The example config uses k8v4, so with that config the patch is inactive.
 
 ```bash
 git clone https://github.com/Niko1221/Strata.git && cd Strata

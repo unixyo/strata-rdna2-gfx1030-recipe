@@ -24,7 +24,7 @@ This repository records how [Strata](https://github.com/Niko1221/Strata) was tun
 ## What mattered most
 
 1. **IQ3_XXS instead of IQ3_S.** With 64 GB of RAM the 40 GiB IQ3_XXS experts stay in the page cache and the 47 GiB IQ3_S experts do not. Prefill went up 1.1-3.5x and decode went from 22-41 to 40-45 tok/s from this alone.
-2. **gfx1030 prompt paths:** FP16 prompt GEMMs with a rocBLAS tuning table (`STRATA_HIP_PROMPT_F16`, `STRATA_ROCBLAS_TUNING`), SIMT QSA select, the #3381 prompt attention backport.
+2. **gfx1030 prompt paths:** FP16 prompt GEMMs with a rocBLAS tuning table (`STRATA_HIP_PROMPT_F16`, `STRATA_ROCBLAS_TUNING`) and SIMT QSA select. The #3381 prompt attention backport (patch 0005) only runs with int8 KV; with the k8v4 KV of the final config it falls back to the split path and does nothing (see `results/` step 3).
 3. **GDN switches** (`STRATA_GDN_HEAD/PP/CONVL2/NOY`, `STRATA_CVEC_FUSE`): +5-12% depending on prompt length.
 4. **`STRATA_ROUTE_RESIDENT=1.0`:** +8-18% decode, but it changes the model's output. Check quality on your own tasks.
 5. **Leave RAM to the page cache.** Pinning experts in RAM or growing the resident KV made everything slower.

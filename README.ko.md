@@ -24,7 +24,7 @@
 ## 효과가 컸던 순서
 
 1. **IQ3_S 대신 IQ3_XXS.** 램 64GB에서는 40GiB인 IQ3_XXS 전문가가 페이지 캐시에 다 올라가고, 47GiB인 IQ3_S는 다 못 올라간다. 이것만으로 프리필이 1.1~3.5배 올랐고 디코드는 22~41에서 40~45 tok/s가 됐다.
-2. **gfx1030 프롬프트 경로:** rocBLAS 튜닝표를 쓴 FP16 프롬프트 GEMM(`STRATA_HIP_PROMPT_F16`, `STRATA_ROCBLAS_TUNING`), SIMT QSA select, #3381 프롬프트 어텐션 백포트.
+2. **gfx1030 프롬프트 경로:** rocBLAS 튜닝표를 쓴 FP16 프롬프트 GEMM(`STRATA_HIP_PROMPT_F16`, `STRATA_ROCBLAS_TUNING`), SIMT QSA select. #3381 프롬프트 어텐션 백포트(패치 0005)는 int8 KV에서만 돈다. 최종 설정의 k8v4 KV에서는 split 경로로 되돌아가 아무 일도 하지 않는다(`results/` 3단계).
 3. **GDN 스위치**(`STRATA_GDN_HEAD/PP/CONVL2/NOY`, `STRATA_CVEC_FUSE`): 프롬프트 길이에 따라 +5~12%.
 4. **`STRATA_ROUTE_RESIDENT=1.0`:** 디코드 +8~18%. 다만 모델 출력이 달라진다. 자기 작업으로 품질을 확인할 것.
 5. **램은 페이지 캐시에 양보한다.** 전문가를 램에 고정하거나 상주 KV를 늘리면 전부 느려졌다.
