@@ -14,6 +14,8 @@ This repository records how [Strata](https://github.com/Niko1221/Strata) was tun
 | [`config/engine.example.json`](config/engine.example.json) | The server config with paths replaced by placeholders |
 | [`patches/`](patches/README.md) | Five engine patches on Strata v0.1.42 (three backport upstream PRs) and a server patch |
 
+Related: the [RDNA2 gfx1030 AI optimization handbook](https://github.com/unixyo/rdna2-gfx1030-ai-handbook) collects operator-level measurements from the same machine. Its §9.18 covers later Strata prefill research (typical-J tiles, the warm bottleneck), which builds on this recipe and does not change its settings.
+
 ## Quick start
 
 1. Install a ROCm runtime that knows gfx103x. This machine used AMD's TheRock `gfx103X-all` 10.0.0 tarball unpacked in a user directory, with no `HSA_OVERRIDE_GFX_VERSION`.
