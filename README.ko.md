@@ -14,6 +14,8 @@
 | [`config/engine.example.json`](config/engine.example.json) | 경로를 자리표시자로 바꾼 서버 설정 |
 | [`patches/`](patches/README.md) | Strata v0.1.42용 엔진 패치 5개(그중 3개는 본가 PR 백포트)와 서버 패치 |
 
+관련 자료: 같은 PC에서 잰 연산 단위 측정은 [RDNA2 gfx1030 AI 최적화 핸드북](https://github.com/unixyo/rdna2-gfx1030-ai-handbook)에 있다. 핸드북 §9.18은 이 레시피 위에서 한 Strata 프리필 후속 연구(typical-J 타일, warm 병목)이고, 이 레시피의 설정을 바꾸지 않는다.
+
 ## 빠른 시작
 
 1. gfx103x를 아는 ROCm을 준비한다. 이 기계는 AMD TheRock `gfx103X-all` 10.0.0 tarball을 사용자 폴더에 풀어 썼고, `HSA_OVERRIDE_GFX_VERSION`은 쓰지 않았다.
