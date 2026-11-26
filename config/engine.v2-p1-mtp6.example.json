@@ -1,5 +1,5 @@
 {
-  "_comment": "Sanitized v2 P1_MTP6 (speed/latency balanced) config for RX 6900 XT (gfx1030) + 64 GB RAM + Zen 4 on Strata 2af30ccaa + patches/v2/000[1-4]. Replace every <...> placeholder. Optional: add STRATA_IQ512_EXACT_GU=1 on Zen 4 AVX-512 CPUs.",
+  "_comment": "Sanitized daily-use v2 P1_MTP6 example config (--vision ON, reserve 896 MiB, STRATA_IQ512_EXACT_GU=1) for RX 6900 XT (gfx1030) + 64 GB RAM + Zen 4 on Strata 2af30ccaa + patches/v2/000[1-4]. Note: results/v2-phase1-2.md benchmark tables ran text-only (--vision OFF), reserve 512/768 MiB, and STRATA_IQ512_EXACT_GU OFF. Replace every <...> placeholder.",
   "exe": "<build-dir>/strata",
   "backend": "hip",
   "port": 18090,

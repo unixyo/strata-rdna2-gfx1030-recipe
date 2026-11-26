@@ -1,5 +1,5 @@
 {
-  "_comment": "Sanitized v2 P2_CAL (quality-hardened SMART v2; -66.1% held-out excess NLL vs P1_MTP6) config for RX 6900 XT + 64 GB RAM + Zen 4 on Strata 2af30ccaa + patches/v2/000[1-4]. Replace every <...> placeholder. For routing-off conservative mode (EXACT_P2), set STRATA_ROUTE_SMART=0 and remove STRATA_ROUTE_SMART_V2.",
+  "_comment": "Sanitized daily-use v2 P2_CAL example config (--vision ON, reserve 896 MiB, STRATA_IQ512_EXACT_GU=1) for RX 6900 XT + 64 GB RAM + Zen 4 on Strata 2af30ccaa + patches/v2/000[1-4]. Note: results/v2-phase1-2.md benchmark tables ran text-only (--vision OFF), reserve 768 MiB, and STRATA_IQ512_EXACT_GU OFF. For routing-off reference mode (EXACT_P2; note STRATA_HC_REQ8=1 and STRATA_LM_I8=1 remain output-changing), set STRATA_ROUTE_SMART=0 and remove STRATA_ROUTE_SMART_V2. Replace every <...> placeholder.",
   "exe": "<build-dir>/strata",
   "backend": "hip",
   "port": 18090,

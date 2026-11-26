@@ -6,15 +6,15 @@
 
 **이 기계의 결과:** 처음 읽는 9.7K~119K 프롬프트의 프리필 약 1,200~1,300 tok/s, 짧은 후속 요청의 디코드 50~64 tok/s, 컨텍스트 256K, 이미지 입력 켬. 같은 기계의 시작점은 프리필 382~414 tok/s(9.7K), 디코드 26~37 tok/s였다.
 
-> **2026-11-26 v2 업데이트 (Strata `2af30ccaa` / v0.2.21.1 기반):** opt-in Phase 1·2 RDNA2 + Zen 4 패치([`patches/v2/`](patches/v2/README.md), [`results/v2-phase1-2.md`](results/v2-phase1-2.md))로 웜 4K~16K 디코드를 **89~101 tok/s**(`P1_MTP6`, 기존 고정 `v0.2.16` 4K 중앙값 `35.3 tok/s`)까지 끌어올리고, 매칭 16K 직접 SSD 읽기량을 **-55.5%**(`53.97 → 23.99 GiB`, `STRATA_LM_I8=1`) 줄였다. 품질 보강형 `P2_CAL`(보류 808토큰 추가 NLL **-66.1%**, 엄격 `finish_reason=="stop"` **8/8 통과**), 비트 동일 Zen 4 AVX-512 IQ Gate/Up(`STRATA_IQ512_EXACT_GU=1`), fail-closed `O_DIRECT` 오류 처리 및 실시간 NVMe 워치독([`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py))을 포함한다.
+> **2026-11-26 v2 업데이트 (Strata `2af30ccaa` / v0.2.21.1 커스텀 패치 빌드):** opt-in Phase 1·2 RDNA2 패치([`patches/v2/`](patches/v2/README.md), [`results/v2-phase1-2.md`](results/v2-phase1-2.md); 비표준 텍스트 전용, `n=1~2`) 기준 웜 4K~16K 디코드는 근사 라우팅 OFF(`EXACT_P2` routing-off 기준) **50~59 tok/s**, 근사 라우팅 ON(`P1_MTP6`, 출력 변경 `STRATA_ROUTE_SMART`) **89~101 tok/s**다. 매칭 16K 직접 SSD 읽기량은 **-55.5%**(`53.97 → 23.99 GiB`, 시간 `-11.4%` / 처리량 `+12.9%`, `STRATA_LM_I8=1`) 줄였고, 드리프트 완화형 `P2_CAL`(808토큰 1세트 기준 `SMART v1` 대비 추가 NLL `-66.1%`, 8태스크 채점 + `finish_reason=="stop"` 8/8), CPU 컴포넌트 검증 완료 Zen 4 AVX-512 exact IQ Gate/Up 패치(`STRATA_IQ512_EXACT_GU=1`, E2E 표 미포함), fail-closed `O_DIRECT` 오류 처리 및 읽기 전용 NVMe 워치독([`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py))을 포함한다.
 
 | | |
 |---|---|
 | [`hardware.md`](hardware.md) | 기계 사양, ROCm, 엔진 빌드 옵션 |
 | [`results/`](results/README.md) | 기존 v0.1.42 측정 효과, VRAM 분해, 실제 요청 분포 |
-| [`results/v2-phase1-2.md`](results/v2-phase1-2.md) | **2026-11-26 v2:** 독립 감사 거친 Phase 1·2 ABBA, 16K `LM_I8` I/O, 808토큰 PPL, 엄격 8/8 품질, AVX-512 통합, 저장장치 안전화 |
+| [`results/v2-phase1-2.md`](results/v2-phase1-2.md) | **2026-11-26 v2:** 커스텀 빌드 Phase 1·2 ABBA(`n=1~2`), 16K `LM_I8` I/O, 808토큰 드리프트·8태스크 완료 점검, CPU 전용 AVX-512 검증, 저장장치 완화 조치 |
 | [`rejected.md`](rejected.md) | 이 하드웨어에서 시도했다가 손해 본 것 (2026-11-26 보강) |
-| [`config/`](config/engine.v2-p1-mtp6.example.json) | 자리표시자 서버 설정 (`engine.example.json` v0.1.42; `engine.v2-p1-mtp6.example.json`, `engine.v2-p2-cal.example.json` v2) |
+| [`config/`](config/engine.v2-p1-mtp6.example.json) | 자리표시자 서버 설정 (`engine.example.json` v0.1.42; 실사용 예시 `engine.v2-p1-mtp6.example.json`, `engine.v2-p2-cal.example.json` — `results/v2-phase1-2.md` 주석 참고) |
 | [`patches/`](patches/README.md) | v0.1.42 패치(`patches/engine/`, `patches/serve/`) 및 **`2af30ccaa`용 v2 opt-in 패치**([`patches/v2/`](patches/v2/README.md)) |
 | [`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py) | 읽기 전용 sysfs 실시간 NVMe 상태·온도 워치독 및 단위 테스트(`test_nvme_watchdog.py`) |
 
