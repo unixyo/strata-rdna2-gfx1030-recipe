@@ -6,13 +6,17 @@ This repository records how [Strata](https://github.com/Niko1221/Strata) was tun
 
 **Result on this machine:** about 1,200-1,300 tok/s prefill on fresh 9.7K-119K prompts, 50-64 tok/s decode on short follow-up requests, 256K context, vision on. The same box started the day at 382-414 tok/s prefill (9.7K) and 26-37 tok/s decode.
 
+> **2026-11-26 v2 Update (Strata `2af30ccaa` / v0.2.21.1):** Opt-in Phase 1/2 RDNA2 + Zen 4 patches ([`patches/v2/`](patches/v2/README.md), [`results/v2-phase1-2.md`](results/v2-phase1-2.md)) push warm 4K–16K decode to **89–101 tok/s** (`P1_MTP6`, vs `35.3 tok/s` pinned `v0.2.16` 4K median), cut matched 16K direct SSD reads by **-55.5%** (`53.97 → 23.99 GiB` via `STRATA_LM_I8=1`), add quality-hardened `P2_CAL` (`-66.1%` held-out excess NLL, **8/8 strict `finish_reason=="stop"` PASS**), integrate bit-exact Zen 4 AVX-512 IQ Gate/Up (`STRATA_IQ512_EXACT_GU=1`), and add fail-closed `O_DIRECT` error handling + a continuous NVMe watchdog ([`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py)).
+
 | | |
 |---|---|
 | [`hardware.md`](hardware.md) | The machine, ROCm build, engine build flags |
-| [`results/`](results/README.md) | Every change with its measured effect, VRAM breakdown, real-use request shape |
-| [`rejected.md`](rejected.md) | What was tried and lost on this hardware |
-| [`config/engine.example.json`](config/engine.example.json) | The server config with paths replaced by placeholders |
-| [`patches/`](patches/README.md) | Five engine patches on Strata v0.1.42 (three backport upstream PRs) and a server patch |
+| [`results/`](results/README.md) | Historical v0.1.42 measurements, VRAM breakdown, real-use request shape |
+| [`results/v2-phase1-2.md`](results/v2-phase1-2.md) | **2026-11-26 v2:** independently audited Phase 1/2 ABBA, 16K `LM_I8` I/O, 808-tok PPL, strict 8/8 quality, AVX-512 CPU integration, and storage hardening |
+| [`rejected.md`](rejected.md) | What was tried and lost on this hardware (updated 2026-11-26) |
+| [`config/`](config/engine.v2-p1-mtp6.example.json) | Sanitized example configs (`engine.example.json` v0.1.42; `engine.v2-p1-mtp6.example.json` & `engine.v2-p2-cal.example.json` v2) |
+| [`patches/`](patches/README.md) | v0.1.42 patches (`patches/engine/`, `patches/serve/`) and **v2 opt-in patches on `2af30ccaa`** ([`patches/v2/`](patches/v2/README.md)) |
+| [`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py) | Continuous read-only sysfs NVMe health/temperature watchdog + unit tests (`test_nvme_watchdog.py`) |
 
 Related: the [RDNA2 gfx1030 AI optimization handbook](https://github.com/unixyo/rdna2-gfx1030-ai-handbook) collects operator-level measurements from the same machine. Its §9.18 covers later Strata prefill research (typical-J tiles, the warm bottleneck), which builds on this recipe and does not change its settings.
 

@@ -18,3 +18,15 @@ Measured on the machine in `hardware.md`. "Rejected" means it was slower, unstab
 | `--kv-grow` | Not available in the 0.1.42 HIP build. Upstream added a HIP path in 0.2.0-beta; not tested here. |
 
 General lesson for this machine: any setting that takes more RAM away from the page cache lost. With 64 GB the remaining big levers are more RAM, a newer engine, or more VRAM.
+
+## 2026-11-26 additions (Strata `2af30ccaa` / v0.2.21.1)
+
+| What | Result |
+|---|---|
+| `STRATA_IO_PREFETCH=0` | Severe cold-decode regression (`19.9 tok/s`, `CPU 97.2 ms/win`, `124,952` major faults for `519.6 MB`). Disabling `STRATA_IO_PREFETCH` turns off `io_fill_` 1.6 MiB demand `pread`s even when `PF_AHEAD=0`. Always keep `STRATA_IO_PREFETCH=1 STRATA_IO_PF_AHEAD=0 STRATA_IO_PF_STAGE=0`. |
+| `STRATA_SPEC_COST=1` | Cold-miss windows (`70–80 ms`) poisoned its per-width EMA cost estimates for `T=5,6`, leaving `avgT = 2.30–2.48` (slower than fixed `--spec 4` `3.06–3.62`) even after VRAM warmed up. Replaced by `STRATA_MTP_ADAPT`. |
+| `STRATA_EXPERTS_SEQ_READAHEAD=1` (`MADV_SEQUENTIAL`) alone | Insufficient under ~31 GiB available RAM (`4k_r1` `43.4 s` / `1.06M` major faults, `16k_r1` `92.5 s` / `2.12M` faults) because buffered readahead still thrashes the LRU page cache across a 40 GiB scan. |
+| `STRATA_ADAPT_OVERLAP=1` with `STRATA_SKIP_ZERO_PCIE=1` | Automatically disabled by the engine when on-device residency planning is active. |
+| `STRATA_PF_DIRECT_HYBRID=1` at 12 stager threads | Sustained ~6.89 GB/s scanning coincided with a KIOXIA EXCERIA PRO NVMe controller drop (`CSTS=0xffffffff`, `-19 ENODEV`). Lowered default to **4 threads** (`6,598 MB/s` = 95.8% peak, 1/3 queue depth), made `copy_blob_hybrid`/`Prefill::Stager` **fail-closed** on `EIO`/`ENODEV`/`ENXIO`, added continuous read-only sysfs watchdog (`scripts/nvme_watchdog.py`), and removed swap from the model SSD. |
+| `STRATA_LM_I8=1` with `--spec 6` and `--vram-reserve-mib 768` | Left `736 MiB` free VRAM after graph capture (50 MiB short of the `786 MiB` 16K super-chunk threshold), silently falling back to chunk-major. Raising to `--vram-reserve-mib 896` leaves `874 MiB` free and reliably activates `LM_I8`. |
+| `STRATA_IQ4NL_PAIR_ROWS=1` (CPU IQ4_NL down two-row) | Bit-exact, but multi-core 7-worker pool A/B regressed down-phase time by **-5.99%** (`1.852 -> 1.963 ms`). Not adopted. |

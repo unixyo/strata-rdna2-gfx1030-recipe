@@ -1,0 +1,1157 @@
+From 460922acc8260e1b97f3cf96e92c33aabfa37156 Mon Sep 17 00:00:00 2001
+From: unixyo <247697626+unixyo@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:14:26 +0900
+Subject: [PATCH] research(rdna2-p2): opt-in hybrid O_DIRECT prefill, HIP
+ layer-major OWN-I8, SMART v2 + cold-cap adapt, and cache-aware MTP
+
+---
+ engine/include/strata/core/expert_source.hpp  |  15 ++
+ engine/include/strata/core/verify.hpp         |   6 +
+ engine/include/strata/kernels/route_smart.hpp |  16 +-
+ engine/src/core/expert_source.cpp             | 140 ++++++++++++++
+ engine/src/core/verify.cpp                    |  59 +++++-
+ engine/src/kernels/cuda/route_smart.cu        |  67 +++++--
+ engine/src/prefill/prefill.cpp                | 179 ++++++++++++++----
+ engine/src/program/generate.cpp               | 152 ++++++++++++++-
+ 8 files changed, 560 insertions(+), 74 deletions(-)
+
+diff --git a/engine/include/strata/core/expert_source.hpp b/engine/include/strata/core/expert_source.hpp
+index 66c13c797..45359832c 100644
+--- a/engine/include/strata/core/expert_source.hpp
++++ b/engine/include/strata/core/expert_source.hpp
+@@ -269,6 +269,15 @@ public:
+     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
+     /// Default: copy_blob one by one.
+     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
++    /// Phase 2 opt-in (STRATA_PF_DIRECT_HYBRID=1): prefill stager reads page-cache-warm experts via mmap memcpy
++    /// and cold experts via O_DIRECT pread (full NVMe throughput, zero page-cache pollution, zero major faults).
++    virtual bool hybrid_direct_prefill() const { return false; }
++    virtual bool copy_blob_hybrid(int64_t layer, int64_t expert, uint8_t* dst) { return copy_blob(layer, expert, dst); }
++    /// Phase 2 opt-in (SMART v2): scan OS page-cache residency of all (layer, expert) pairs into a packed bitset
++    /// (ceil(n_layers * n_expert / 32) uint32_t words; bit 1 = warm in RAM/page-cache, 0 = cold on SSD).
++    virtual bool scan_warm_bitmap(uint32_t* bits, int64_t n_layers, int64_t n_expert) const {
++        (void) bits; (void) n_layers; (void) n_expert; return false;
++    }
+     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
+     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
+     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+@@ -979,6 +988,9 @@ public:
+     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
+     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
++    bool hybrid_direct_prefill() const override { return hybrid_pf_; }
++    bool copy_blob_hybrid(int64_t layer, int64_t expert, uint8_t* dst) override;
++    bool scan_warm_bitmap(uint32_t* bits, int64_t n_layers, int64_t n_expert) const override;
+     /// CS-T: advances the assembled blobs' age (see staged_blob).
+     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
+@@ -1308,7 +1320,10 @@ private:
+     void* mapping_ = nullptr;
+ #else
+     int fd_ = -1;
++    int direct_prefill_fd_ = -1;
+ #endif
++    bool hybrid_pf_ = false;
++    std::atomic<uint64_t> hybrid_warm_blobs_{0}, hybrid_direct_blobs_{0}, hybrid_direct_bytes_{0};
+     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
+     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered
+     uint64_t startup_blob_bytes_ = 0, startup_us_ = 0;   ///< the staged reads' counters at its begin (put back at the end)
+diff --git a/engine/include/strata/core/verify.hpp b/engine/include/strata/core/verify.hpp
+index 088a854de..f635d5a43 100644
+--- a/engine/include/strata/core/verify.hpp
++++ b/engine/include/strata/core/verify.hpp
+@@ -126,6 +126,10 @@ public:
+     bool prepare(int T, bool& no_vram, std::string& err);
+     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
+     bool copy_logits(int t, float* host) const;
++    /// Phase 2 SMART v2 (opt-in, STRATA_ROUTE_SMART_V2): upload OS page-cache warm bitmap
++    /// (n_layers * ceil(n_expert / 32) uint32s) into the fixed arena buffer without recapturing graphs.
++    bool update_warm_bitmap(const uint32_t* host_bits, size_t n_words);
++    static bool route_smart_v2_on();
+     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
+     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
+@@ -593,6 +597,8 @@ private:
+     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
+     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
+     unsigned long long* rsm_stats_ = nullptr;  ///< STRATA_ROUTE_SMART's counters on device_; null: none
++    uint32_t* rsm_warm_ = nullptr;             ///< STRATA_ROUTE_SMART_V2: per-layer warm bitmap in arena_
++    size_t rsm_warm_words_ = 0;
+     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
+     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
+     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
+diff --git a/engine/include/strata/kernels/route_smart.hpp b/engine/include/strata/kernels/route_smart.hpp
+index 3276c67fd..7594edaaa 100644
+--- a/engine/include/strata/kernels/route_smart.hpp
++++ b/engine/include/strata/kernels/route_smart.hpp
+@@ -15,11 +15,17 @@
+ namespace strata::kernels {
+ 
+ struct RouteSmartParams {
+-    float budget = 0.0f;      ///< cumulative per-token weighted perturbation budget sum(w[r]*(l[e]-l[f]))
+-    float max_gap = 3.0f;     ///< hard cap on individual logit gap (l[e] - l[f])
+-    int core_k = 2;           ///< top ranks [0..core_k-1] are strictly protected (never swapped)
+-    int win_share = 1;        ///< 1: allow zero-extra-cost reuse of mandatory cold misses in the same window
+-    int decode_only = 1;      ///< 1: apply only to decode windows (n_tok <= 8); 0: also prompt chunks
++    float budget = 0.0f;           ///< cumulative per-token weighted perturbation budget sum(w[r]*(l[e]-l[f]))
++    float max_gap = 3.0f;          ///< hard cap on individual logit gap (l[e] - l[f])
++    int core_k = 2;                ///< top ranks [0..core_k-1] are strictly protected (never swapped)
++    int win_share = 1;             ///< 1: allow zero-extra-cost reuse of mandatory cold misses in the same window
++    int decode_only = 1;           ///< 1: apply only to decode windows (n_tok <= 8); 0: also prompt chunks
++    // Phase 2 SMART v2 extensions (defaults preserve exact v1 behavior):
++    const uint32_t* warm_layer = nullptr; ///< optional 16xuint32 device bitset (bit e=1: RAM page-cache warm, 0: SSD cold)
++    float warm_cost_mult = 1.0f;          ///< cost multiplier for RAM-warm misses (>1 preserves warm misses for quality)
++    float cold_budget_mult = 1.0f;        ///< budget slack multiplier for SSD-cold misses (>1 targets SSD stalls)
++    float layer_mult = 1.0f;              ///< per-layer budget multiplier (<1 protects sensitive early/late layers)
++    float sens_gain = 0.0f;               ///< token-margin sensitivity adaptation strength (0 = disabled)
+ };
+ 
+ // stats layout (10 x uint64_t on device, optional nullptr):
+diff --git a/engine/src/core/expert_source.cpp b/engine/src/core/expert_source.cpp
+index 91ee22d14..9ea23ace0 100644
+--- a/engine/src/core/expert_source.cpp
++++ b/engine/src/core/expert_source.cpp
+@@ -1658,6 +1658,20 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
+     fd_ = fd;
+     base_ = (const uint8_t*) view;
+     paths_.assign(1, path);   // #286: open_direct opens it again with O_DIRECT
++#if defined(__linux__) && defined(O_DIRECT)
++    if (const char* hv = std::getenv("STRATA_PF_DIRECT_HYBRID"); hv != nullptr && hv[0] == '1') {
++        const int dfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
++        if (dfd >= 0) {
++            direct_prefill_fd_ = dfd;
++            hybrid_pf_ = true;
++            std::fprintf(stderr, "FileExpertSource: STRATA_PF_DIRECT_HYBRID=1: prefill uses RAM memcpy for page-cache-warm experts and O_DIRECT pread for cold experts (%s)\n",
++                         path.c_str());
++        } else {
++            std::fprintf(stderr, "FileExpertSource: STRATA_PF_DIRECT_HYBRID=1 requested, but O_DIRECT open failed on %s; keeping mapped reads\n",
++                         path.c_str());
++        }
++    }
++#endif
+ #endif
+     blobs_ = (int64_t) blob_count;
+     n_layers_ = n_layers;
+@@ -1768,7 +1782,23 @@ void FileExpertSource::close() {
+     mapping_ = nullptr;
+     file_ = nullptr;
+ #else
++    if (hybrid_pf_) {
++        const uint64_t wb = hybrid_warm_blobs_.load(std::memory_order_relaxed);
++        const uint64_t db = hybrid_direct_blobs_.load(std::memory_order_relaxed);
++        const uint64_t dbytes = hybrid_direct_bytes_.load(std::memory_order_relaxed);
++        if (wb + db > 0) {
++            std::fprintf(stderr, "FileExpertSource: STRATA_PF_DIRECT_HYBRID stats: warm_ram=%llu direct_ssd=%llu (%.1f MB direct, %.1f%% warm hit)\n",
++                         (unsigned long long) wb, (unsigned long long) db, (double) dbytes / 1048576.0,
++                         100.0 * (double) wb / (double) (wb + db));
++        }
++    }
+     if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
++    if (direct_prefill_fd_ >= 0) ::close(direct_prefill_fd_);
++    direct_prefill_fd_ = -1;
++    hybrid_pf_ = false;
++    hybrid_warm_blobs_.store(0);
++    hybrid_direct_blobs_.store(0);
++    hybrid_direct_bytes_.store(0);
+     if (fd_ >= 0) ::close(fd_);
+     fd_ = -1;
+ #endif
+@@ -3882,11 +3912,121 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+     return true;
+ }
+ 
++bool FileExpertSource::copy_blob_hybrid(int64_t layer, int64_t expert, uint8_t* dst) {
++    if (!hybrid_pf_ || !role_ptr_.empty() || unmapped_ || base_ == nullptr || dst == nullptr ||
++        layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) {
++        return copy_blob(layer, expert, dst);
++    }
++    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
++    if (complement_ready_) {
++        const uint8_t* held = resident_blob(index);
++        if (held == nullptr && !override_.empty()) held = override_[index];
++        if (held != nullptr) {
++            std::memcpy(dst, held, (size_t) bytes);
++            hybrid_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
++            return true;
++        }
++    }
++    const uint64_t off = layer_offsets_[(size_t) layer] + (uint64_t) expert * bytes;
++    if (off + bytes > mapped_bytes_) return false;
++#if defined(__linux__) && defined(O_DIRECT)
++    const uint8_t* mp = base_ + (size_t) off;
++    // Fast 4-page mincore residency probe: if warm in OS page cache, read from RAM at ~30 GB/s (0 SSD I/O).
++    if (resident_sampled(mp, bytes) >= bytes) {
++        std::memcpy(dst, mp, (size_t) bytes);
++        hybrid_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
++        file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
++        return true;
++    }
++    if (direct_prefill_fd_ >= 0) {
++        constexpr uint64_t kAlign = 4096ull;
++        const uint64_t a_off = off & ~(kAlign - 1ull);
++        const size_t head = (size_t) (off - a_off);
++        const uint64_t a_len = (uint64_t) ((head + bytes + kAlign - 1ull) & ~(kAlign - 1ull));
++        if (a_off + a_len <= mapped_bytes_) {
++            const auto t0 = std::chrono::steady_clock::now();
++            bool ok = false;
++            if (head == 0 && (bytes & (kAlign - 1ull)) == 0 && (((uintptr_t) dst) & (kAlign - 1ull)) == 0) {
++                ok = pread_full(direct_prefill_fd_, dst, bytes, off);
++            } else {
++                struct AlignedScratch {
++                    uint8_t* ptr = nullptr;
++                    size_t cap = 0;
++                    ~AlignedScratch() { if (ptr) std::free(ptr); }
++                    uint8_t* ensure(size_t need) {
++                        if (cap >= need) return ptr;
++                        if (ptr) { std::free(ptr); ptr = nullptr; cap = 0; }
++                        void* p = nullptr;
++                        if (posix_memalign(&p, 4096, need) != 0 || p == nullptr) return nullptr;
++                        ptr = (uint8_t*) p;
++                        cap = need;
++                        return ptr;
++                    }
++                };
++                thread_local AlignedScratch tls;
++                uint8_t* buf = tls.ensure((size_t) a_len);
++                if (buf != nullptr && pread_full(direct_prefill_fd_, buf, a_len, a_off)) {
++                    std::memcpy(dst, buf + head, (size_t) bytes);
++                    ok = true;
++                }
++            }
++            if (ok) {
++                file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
++                                   std::memory_order_relaxed);
++                file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
++                hybrid_direct_blobs_.fetch_add(1, std::memory_order_relaxed);
++                hybrid_direct_bytes_.fetch_add(bytes, std::memory_order_relaxed);
++                return true;
++            }
++        }
++    }
++#endif
++    return copy_blob(layer, expert, dst);
++}
++
++bool FileExpertSource::scan_warm_bitmap(uint32_t* bits, int64_t n_layers, int64_t n_expert) const {
++    if (bits == nullptr || n_layers <= 0 || n_expert <= 0 || n_layers != n_layers_ || n_expert != n_expert_) return false;
++    const size_t n_words = (size_t) ((n_layers * n_expert + 31) / 32);
++    std::memset(bits, 0, n_words * sizeof(uint32_t));
++#if defined(__linux__)
++    if (base_ == nullptr || unmapped_ || !role_ptr_.empty()) return false;
++    constexpr uintptr_t kPg = 4096;
++    for (int64_t l = 0; l < n_layers_; ++l) {
++        const uint64_t bb = layer_blob_bytes_[(size_t) l];
++        if (bb == 0) continue;
++        const uint64_t loff = layer_offsets_[(size_t) l];
++        if (loff + bb * (uint64_t) n_expert_ > mapped_bytes_) continue;
++        for (int64_t e = 0; e < n_expert_; ++e) {
++            const size_t idx = (size_t) l * (size_t) n_expert_ + (size_t) e;
++            bool warm = false;
++            if (complement_ready_ && (resident_blob(idx) != nullptr || (!override_.empty() && override_[idx] != nullptr))) {
++                warm = true;
++            } else {
++                // Probe 1 middle page per expert (24,576 x 1-page mincore: ~5-10 ms total vs ~300 ms for 10.5M pages).
++                const uintptr_t mid = (uintptr_t) (base_ + (size_t) (loff + (uint64_t) e * bb + bb / 2));
++                unsigned char v = 0;
++                if (mincore((void*) (mid & ~(kPg - 1)), kPg, &v) == 0 && (v & 1)) warm = true;
++            }
++            if (warm) bits[idx >> 5] |= (1u << (idx & 31));
++        }
++    }
++    return true;
++#else
++    return false;
++#endif
++}
++
+ // pp-opt: the prompt path streams a chunk's experts in file order, so a stager thread's run of jobs is mostly
+ // neighbouring blobs of experts.bin.  One read_direct batch merges them into requests of up to 32 MiB (kMerge) where
+ // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
+ // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
+ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
++    if (hybrid_pf_ && direct_.empty() && pdirect_.empty()) {
++        for (size_t i = 0; i < n; ++i)
++            if (!copy_blob_hybrid(layers[i], experts[i], dst[i])) return false;
++        return true;
++    }
+     if ((direct_.empty() && pdirect_.empty()) || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+     thread_local std::vector<Fill> fills;
+     fills.clear();
+diff --git a/engine/src/core/verify.cpp b/engine/src/core/verify.cpp
+index 29d88938a..750268c50 100644
+--- a/engine/src/core/verify.cpp
++++ b/engine/src/core/verify.cpp
+@@ -192,6 +192,9 @@ struct RouteSmartCfg;
+ RouteSmartCfg& route_smart_cfg();
+ struct RouteSmartCfg {
+     strata::kernels::RouteSmartParams p;
++    bool v2_on = false;
++    int edge_layers = 0;
++    float edge_mult = 1.0f;
+     std::mutex mu;
+     std::map<int, unsigned long long*> blocks;
+     unsigned long long* stats_on(int dev) {
+@@ -224,10 +227,15 @@ struct RouteSmartCfg {
+                     const double orig_c = h[0] ? (double) h[6] / (double) h[0] : 0.0;
+                     const double fin_c = h[0] ? (double) h[7] / (double) h[0] : 0.0;
+                     std::fprintf(stderr,
+-                                 "route-smart: budget=%g max_gap=%g core_k=%d win_share=%d decode_only=%d | "
+-                                 "wins=%llu toks=%llu mod=%llu | misses %llu->%llu (vram_sw=%llu win_sw=%llu) | "
++                                 "route-smart: budget=%g max_gap=%g core_k=%d win_share=%d decode_only=%d",
++                                 c.p.budget, c.p.max_gap, c.p.core_k, c.p.win_share, c.p.decode_only);
++                    if (c.v2_on) {
++                        std::fprintf(stderr, " v2(warm_m=%g cold_m=%g edge=%dx%g sens=%g)",
++                                     c.p.warm_cost_mult, c.p.cold_budget_mult, c.edge_layers, c.edge_mult, c.p.sens_gain);
++                    }
++                    std::fprintf(stderr,
++                                 " | wins=%llu toks=%llu mod=%llu | misses %llu->%llu (vram_sw=%llu win_sw=%llu) | "
+                                  "distinct_cold/win %.2f->%.2f (%.1f%%) | mean_pert=%.4f\n",
+-                                 c.p.budget, c.p.max_gap, c.p.core_k, c.p.win_share, c.p.decode_only,
+                                  h[0], h[1], h[9], h[2], h[3], h[4], h[5],
+                                  orig_c, fin_c, h[6] ? 100.0 * (1.0 - (double) h[7] / (double) h[6]) : 0.0, mean_pert);
+                 }
+@@ -252,6 +260,21 @@ RouteSmartCfg& route_smart_cfg() {
+                 c.p.decode_only = dec;
+             }
+         }
++        // STRATA_ROUTE_SMART_V2="warm_mult[,cold_mult[,edge_layers[,edge_mult[,sens_gain]]]]" (opt-in, default OFF):
++        // tier-aware (OS page-cache RAM-warm vs SSD-cold), layer-edge protected, margin-adaptive SMART v2.
++        if (const char* v2 = std::getenv("STRATA_ROUTE_SMART_V2"); v2 != nullptr && v2[0] != '\0' && v2[0] != '0') {
++            float wm = 1.8f, cm = 1.35f, em = 0.65f, sg = 0.4f;
++            int el = 4;
++            const int n = std::sscanf(v2, "%f,%f,%d,%f,%f", &wm, &cm, &el, &em, &sg);
++            if (n >= 1 && wm > 0.0f) {
++                c.v2_on = true;
++                c.p.warm_cost_mult = wm;
++                c.p.cold_budget_mult = cm > 0.0f ? cm : 1.0f;
++                c.edge_layers = el > 0 ? el : 0;
++                c.edge_mult = em > 0.0f ? em : 1.0f;
++                c.p.sens_gain = sg >= 0.0f ? sg : 0.0f;
++            }
++        }
+         return true;
+     }();
+     (void) parsed;
+@@ -1300,6 +1323,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         one_ = b.take<int32_t>(4);
+         hist_snap_ = b.take<float>(T * HS);
+         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
++        rsm_warm_words_ = (size_t) g.n_layers * (size_t) ((g.n_expert + 31) / 32);
++        rsm_warm_ = b.take<uint32_t>(rsm_warm_words_);
+     };
+     Bump count;
+     carve(count);
+@@ -2744,10 +2769,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+         if (route_smart_cfg().p.budget > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+-            // STRATA_ROUTE_SMART: perturbation-budgeted, window-coherent routing (opt-in, changes the output)
++            // STRATA_ROUTE_SMART (+ optional Phase 2 STRATA_ROUTE_SMART_V2): perturbation-budgeted, window-coherent routing
++            const RouteSmartCfg& rsc = route_smart_cfg();
++            strata::kernels::RouteSmartParams lp = rsc.p;
++            if (rsc.v2_on) {
++                if (rsm_warm_ != nullptr) lp.warm_layer = rsm_warm_ + (size_t) l * 16u;
++                if (rsc.edge_layers > 0 && (l < rsc.edge_layers || l >= g.n_layers - rsc.edge_layers))
++                    lp.layer_mult = rsc.edge_mult;
++            }
+             strata::kernels::route_smart_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert,
+                                                ids_ + tb * K, w_ + tb * K, n,
+-                                               route_smart_cfg().p, rsm_stats_, cs);
++                                               lp, rsm_stats_, cs);
+         } else if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+             try {
+@@ -5952,6 +5984,23 @@ bool Verifier::copy_logits(int t, float* host) const {
+                       cudaMemcpyDeviceToHost) == cudaSuccess;
+ }
+ 
++bool Verifier::route_smart_v2_on() {
++    return route_smart_cfg().v2_on && route_smart_cfg().p.budget > 0.0f;
++}
++
++bool Verifier::update_warm_bitmap(const uint32_t* host_bits, size_t n_words) {
++#if defined(STRATA_GPU_METAL)
++    (void) host_bits; (void) n_words;
++    return false;
++#else
++    if (next_ != nullptr) (void) next_->update_warm_bitmap(host_bits, n_words);
++    if (rsm_warm_ == nullptr || host_bits == nullptr || n_words == 0 || rsm_warm_words_ == 0) return false;
++    const size_t n = std::min(n_words, rsm_warm_words_);
++    const OnDevice on(device_);
++    return cudaMemcpyAsync(rsm_warm_, host_bits, n * sizeof(uint32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess;
++#endif
++}
++
+ 
+ // ================================ PIPELINED WINDOWS (see verify.hpp) ================================
+ //
+diff --git a/engine/src/kernels/cuda/route_smart.cu b/engine/src/kernels/cuda/route_smart.cu
+index ab7a6f6fe..a52f8e1d4 100644
+--- a/engine/src/kernels/cuda/route_smart.cu
++++ b/engine/src/kernels/cuda/route_smart.cu
+@@ -38,10 +38,13 @@ __device__ __forceinline__ void warp_argmax(float& score, int& eid, float& raw_l
+ // One block of n_tok warps (up to kMaxChunkT = 16 warps = 512 threads).
+ // Each warp owns one token `t`; each lane owns 16 experts: e = lane + 32 * i.
+ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* __restrict__ res,
++                              const uint32_t* __restrict__ warm_bits,
+                               int32_t* __restrict__ ids, float* __restrict__ weights, int n_tok,
+                               float budget, float max_gap, int core_k, int win_share,
++                              float warm_cost_mult, float cold_budget_mult, float layer_mult, float sens_gain,
+                               unsigned long long* __restrict__ stats) {
+     __shared__ uint32_t s_win[16];
++    __shared__ uint32_t s_warm[16];
+     __shared__ uint32_t s_orig_cold[16];
+     __shared__ uint32_t s_final_cold[16];
+ 
+@@ -49,6 +52,7 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+     const int lane = threadIdx.x & 31;
+     if (warp == 0 && lane < 16) {
+         s_win[lane] = 0u;
++        s_warm[lane] = (warm_bits != nullptr) ? warm_bits[lane] : 0u;
+         s_orig_cold[lane] = 0u;
+         s_final_cold[lane] = 0u;
+     }
+@@ -106,17 +110,39 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+         }
+     }
+ 
++    // Compute effective token budget (Phase 2 SMART v2: layer sensitivity + token margin adaptation).
++    const int ck_clamped = core_k < 0 ? 0 : (core_k > kK ? kK : core_k);
++    float tok_budget = budget * layer_mult;
++    if (valid_ids && sens_gain > 0.0f && ck_clamped > 0 && ck_clamped < kK) {
++        // Margin between top-1 and first unprotected rank: small margin => contested/sensitive token => lower budget.
++        const float margin = cur_l[0] - cur_l[ck_clamped];
++        float tok_scale = 1.0f;
++        if (margin < 1.0f) {
++            const float tight = fmaxf(0.0f, 1.0f - fmaxf(0.0f, margin));
++            tok_scale = fmaxf(0.50f, 1.0f - sens_gain * tight);
++        } else if (margin > 1.5f) {
++            const float loose = fminf(1.0f, (margin - 1.5f) * 0.5f);
++            tok_scale = 1.0f + 0.25f * sens_gain * loose;
++        }
++        tok_budget *= tok_scale;
++    }
++    const bool use_warm = (warm_bits != nullptr) && (warm_cost_mult != 1.0f || cold_budget_mult != 1.0f);
++    auto eff_cost_of = [&](int e_id, float raw_cost) -> float {
++        if (!use_warm) return raw_cost;
++        const bool is_warm = bit_test(s_warm, e_id);
++        return is_warm ? (raw_cost * warm_cost_mult) : (raw_cost / fmaxf(0.25f, cold_budget_mult));
++    };
++
+     // Phase 1: Protect top core_k ranks; any cold expert among them MUST run on CPU -> register in s_win.
+     if (valid_ids && lane == 0) {
+-        const int ck = core_k < 0 ? 0 : (core_k > kK ? kK : core_k);
+-        for (int r = 0; r < ck; ++r) {
++        for (int r = 0; r < ck_clamped; ++r) {
+             if (!cur_res[r]) bit_set_atomic(s_win, cur_id[r]);
+         }
+     }
+     __syncthreads();
+ 
+     // Phase 2: Find best unpicked VRAM logit for this token; any non-core cold expert whose minimum possible
+-    // VRAM-swap cost already exceeds (max_gap, budget) is very likely to stay cold -> pre-register in s_win
++    // VRAM-swap cost already exceeds (max_gap, tok_budget) is very likely to stay cold -> pre-register in s_win
+     // so sibling tokens in the same window can reuse it at zero extra CPU/SSD bandwidth.
+     if (valid_ids && win_share != 0) {
+         float best_vram_l = -FLT_MAX;
+@@ -131,12 +157,12 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+             best_vram_l = fmaxf(best_vram_l, __shfl_xor_sync(0xffffffffu, best_vram_l, m, 32));
+         }
+         if (lane == 0) {
+-            const int ck = core_k < 0 ? 0 : (core_k > kK ? kK : core_k);
+-            for (int r = ck; r < kK; ++r) {
++            for (int r = ck_clamped; r < kK; ++r) {
+                 if (!cur_res[r] && !bit_test(s_win, cur_id[r])) {
+                     const float gap = cur_l[r] - best_vram_l;
+-                    const float cost = gap > 0.0f ? cur_w[r] * gap : 0.0f;
+-                    if (gap > max_gap || cost > budget) {
++                    const float raw_cost = gap > 0.0f ? cur_w[r] * gap : 0.0f;
++                    const float ecost = eff_cost_of(cur_id[r], raw_cost);
++                    if (gap > max_gap || ecost > tok_budget) {
+                         bit_set_atomic(s_win, cur_id[r]);
+                     }
+                 }
+@@ -153,8 +179,8 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+     bool modified = false;
+ 
+     if (valid_ids) {
+-        const int ck = core_k < 0 ? 0 : (core_k > kK ? kK : core_k);
+-        float rem_budget = budget;
++        const int ck = ck_clamped;
++        float rem_budget = tok_budget;
+         uint16_t win_mask = 0u;
+         if (win_share != 0) {
+ #pragma unroll
+@@ -196,16 +222,19 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+             warp_argmax(best_sc, best_f, best_raw);
+             if (best_f >= kE) break;
+ 
+-            // Among currently eligible cold slots, pick the one with minimum perturbation cost w[r] * max(0, l[e] - best_raw).
++            // Among currently eligible cold slots, pick the one with minimum effective perturbation cost.
+             int best_r = -1;
+-            float best_cost = FLT_MAX;
++            float best_ecost = FLT_MAX;
++            float best_raw_cost = 0.0f;
+             for (int r = ck; r < kK; ++r) {
+                 if (!eligible[r]) continue;
+                 const float gap = cur_l[r] - best_raw;
+                 if (gap > max_gap) continue;
+-                const float cost = gap > 0.0f ? cur_w[r] * gap : 0.0f;
+-                if (cost <= rem_budget && (cost < best_cost || (cost == best_cost && r > best_r))) {
+-                    best_cost = cost;
++                const float raw_cost = gap > 0.0f ? cur_w[r] * gap : 0.0f;
++                const float ecost = eff_cost_of(cur_id[r], raw_cost);
++                if (ecost <= rem_budget && (ecost < best_ecost || (ecost == best_ecost && r > best_r))) {
++                    best_ecost = ecost;
++                    best_raw_cost = raw_cost;
+                     best_r = r;
+                 }
+             }
+@@ -220,8 +249,8 @@ __global__ void route_smart_k(const float* __restrict__ logits, const int32_t* _
+             const bool f_in_vram = res[best_f] >= 0;
+             cur_res[best_r] = f_in_vram ? 1 : 0;
+             eligible[best_r] = 0;
+-            rem_budget -= best_cost;
+-            spent_pert += best_cost;
++            rem_budget -= best_ecost;
++            spent_pert += best_raw_cost;
+             modified = true;
+             if (f_in_vram) ++swapped_vram;
+             else ++swapped_win;
+@@ -292,8 +321,10 @@ void route_smart_top10(const float* logits, const int32_t* res_layer, int32_t* i
+     for (int off = 0; off < n_tok; off += kMaxChunkT) {
+         const int nt = (n_tok - off) < kMaxChunkT ? (n_tok - off) : kMaxChunkT;
+         route_smart_k<<<1, nt * 32, 0, st>>>(
+-            logits + (size_t) off * kE, res_layer, ids + (size_t) off * kK, weights + (size_t) off * kK,
+-            nt, params.budget, params.max_gap, params.core_k, params.win_share, stats);
++            logits + (size_t) off * kE, res_layer, params.warm_layer,
++            ids + (size_t) off * kK, weights + (size_t) off * kK,
++            nt, params.budget, params.max_gap, params.core_k, params.win_share,
++            params.warm_cost_mult, params.cold_budget_mult, params.layer_mult, params.sens_gain, stats);
+     }
+ }
+ 
+diff --git a/engine/src/prefill/prefill.cpp b/engine/src/prefill/prefill.cpp
+index b57db1a71..d2c6bde0c 100644
+--- a/engine/src/prefill/prefill.cpp
++++ b/engine/src/prefill/prefill.cpp
+@@ -2542,8 +2542,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
+             }
+         }
+-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
++        const bool hybrid_pf = src != nullptr && src->hybrid_direct_prefill();
++        // Default 4 threads for STRATA_PF_DIRECT_HYBRID: keeps NVMe queue depth / thermal load safe
++        // (~3-4 GB/s sustained without controller power spikes; override via STRATA_STAGER_THREADS if desired).
++        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32)
++                                : files ? 32 : hybrid_pf ? 4 : std::max(2, std::min(4, hw / 4));
++        if ((files || hybrid_pf) && std::getenv("STRATA_STAGER_RING") == nullptr)
++            m.stager->kRing = std::clamp(4 * threads, 16, 128);
+         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
+         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
+         {
+@@ -4697,7 +4702,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                     int job = -1;
+                     const uint8_t* b = nullptr;
+-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
++                    if (m.src->transient(l, e) || m.src->hybrid_direct_prefill()) {   // CS-T or STRATA_PF_DIRECT_HYBRID: copied by the source into the stager's buffer
+                         job = (int) js.size();
+                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                     } else {
+@@ -7026,7 +7031,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                 if (m.src->pinned(l, e)) continue;
+                                 job_of[j] = (int) js.size();
+-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
++                                if (m.src->transient(l, e) || m.src->hybrid_direct_prefill()) {   // CS-T or STRATA_PF_DIRECT_HYBRID: copied by the source
+                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                                     continue;
+                                 }
+@@ -8093,6 +8098,21 @@ bool lm_force_env() {   // STRATA_PREFILL_LM_FORCE=1 (research): the layer-major
+     return v;
+ }
+ 
++bool lm_i8_env() {   // Phase 2 opt-in (STRATA_LM_I8=1): enable layer-major prefill using OWN-I8 native_expert_i8 kernels on HIP/RDNA2
++    static const bool v = [] { const char* e = std::getenv("STRATA_LM_I8"); return e != nullptr && e[0] == '1'; }();
++    return v;
++}
++
++bool lm_i8_layer(int64_t l) {
++    if (!lm_i8_env()) return false;
++    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
++    if (!lay.native || l < 0 || l >= (int64_t) lay.fmt.size()) return false;
++    const auto& f = lay.fmt[(size_t) l];
++    if (f.had_gu || f.had_d || f.tail_off) return false;
++    const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
++    return strata::kernels::native_expert_i8_prompt(L, (int64_t) 1 << 20);
++}
++
+ bool lm_even_env() {   // even super-chunks (STRATA_PREFILL_LM_EVEN=0: the largest that fits, then the rest)
+     static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_EVEN"); return !(e && e[0] == '0'); }();
+     return v;
+@@ -8171,10 +8191,10 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     if (m.g == nullptr) { why = "not initialized"; return 0; }
+ #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+     // only NVIDIA CUDA has run this path by default; on an AMD build the prompt stays on the chunk-major path unless
+-    // STRATA_LM_HIP=1 (opt-in, PAR-A 2026-10-30: gfx1201 is being qualified)
++    // STRATA_LM_HIP=1 (opt-in, PAR-A 2026-10-30: gfx1201 is being qualified) or STRATA_LM_I8=1 (Phase 2 OWN-I8 path)
+     {
+         static const bool lm_hip = [] { const char* v = std::getenv("STRATA_LM_HIP"); return v != nullptr && v[0] == '1'; }();
+-        if (!lm_hip) {
++        if (!lm_hip && !lm_i8_env()) {
+             why = "layer-major prefill has only been run on NVIDIA CUDA";
+             return 0;
+         }
+@@ -8213,10 +8233,20 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     const MmqPlan& mp = mmq_plan();
+     if ((int64_t) mp.layer.size() < g.n_layers) { why = "the expert plan has fewer layers than the model"; return 0; }
+     // each layer's experts on MMQ, or (port, 2026-10-24) on run_impl's FP16 path; the buffers each one needs
+-    int64_t n_mmq = 0;
+-    for (int64_t l = 0; l < g.n_layers; ++l) n_mmq += mp.layer[(size_t) l] ? 1 : 0;
++    int64_t n_mmq = 0, n_i8 = 0;
++    for (int64_t l = 0; l < g.n_layers; ++l) {
++        if (mp.layer[(size_t) l]) ++n_mmq;
++        else if (lm_i8_layer(l)) ++n_i8;
++    }
+     if (n_mmq > 0 && (!m.grp_gu || !m.grp_d || !m.Xq || !m.H || !m.Hq)) { why = "the MMQ buffers are missing"; return 0; }
+-    if (n_mmq < g.n_layers) {
++    if (n_i8 > 0 && m.i8_rec == nullptr) {
++        if (cudaMalloc((void**) &m.i8_rec, strata::prefill::i8grp::kRecBytes) != cudaSuccess) {
++            cudaGetLastError();
++            why = "the int8 expert launch record could not be allocated";
++            return 0;
++        }
++    }
++    if (n_mmq + n_i8 < g.n_layers) {
+         bool dq_ok = true;
+         for (int i = 0; i < DQ; ++i) dq_ok = dq_ok && m.dq_gu[i] && m.dq_d[i];
+         if (!m.Xs || !m.Hh || !dq_ok) { why = "the FP16 expert path's buffers are missing"; return 0; }
+@@ -8234,25 +8264,37 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+         }
+     }
+     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
+-    if (!m.GU || !m.Dm || (n_mmq > 0 && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
++    if (!m.GU || !m.Dm || ((n_mmq > 0 || n_i8 > 0) && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
+     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
+-    const int64_t min_s = (lm_force_ || lm_force_env()) ? 1 : (lm_tokens_env() > 0 ? m.T : 2 * m.T);   // (lm_force_: run_multi - several prompts, however short)
++    // With STRATA_LM_I8=1, trigger whenever a prompt spans > 1 chunk (n > m.T, e.g. 16382 > 8192 = 2 chunks).
++    const int64_t min_s = (lm_force_ || lm_force_env()) ? 1
++                        : (lm_tokens_env() > 0 ? m.T : (lm_i8_env() ? (m.T + 1) : 2 * m.T));
+     if (n < min_s) { why = "a short prompt"; return 0; }
+-    const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : (lm_by_default_ ? kLmDefaultOnTokens : kLmDefaultTokens);
+-    int64_t S = std::max<int64_t>(min_s, want / m.T * m.T);
++    const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env()
++                       : ((lm_by_default_ || lm_i8_env()) ? kLmDefaultOnTokens : kLmDefaultTokens);
++    const int64_t min_aligned = (min_s + m.T - 1) / m.T * m.T;
++    int64_t S = std::max<int64_t>(min_aligned, want / m.T * m.T);
+     S = std::min<int64_t>(S, (n + m.T - 1) / m.T * m.T);
+     if (cap > 0) {
+-        if ((!lm_force_ && cap % m.T != 0) || cap < min_s) { why = "the layer split's stages read different chunks"; return 0; }
++        if ((!lm_force_ && cap % m.T != 0) || cap < min_aligned) { why = "the layer split's stages read different chunks"; return 0; }
+         S = std::min(S, cap);
+     }
+     // the MoE scratch caps a group's rows (STRATA_PF_GROUP_SCRATCH: GU/H/Hq hold group_cap rows, not T*K)
+     const int64_t G = m.group_cap > 0 ? std::min(m.T * K, m.group_cap) : m.T * K;
+     bool fz = false;   // a layer's groups run on the fused kernels: the super-chunk's int8 rows (LmBufs::xa)
+     for (int64_t l = 0; l < g.n_layers && !fz; ++l) fz = lm_fused_layer(l, m.group_cap > 0);
++    const bool i8_any = n_i8 > 0;
++    const auto xa_bytes = [&](int64_t s) -> uint64_t {
++        uint64_t b = fz ? (uint64_t) fused::act_bytes(s, N) : 0;
++        if (i8_any) b = std::max<uint64_t>(b, (uint64_t) s * (uint64_t) (N / 32) * 36ull);
++        return b;
++    };
++    const bool need_mixed_h = (n_mmq + n_i8 < g.n_layers) || fz;
+     const auto dev_bytes = [&](int64_t s, bool r_dev) {
+-        const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (uint64_t) N * 2 + (r_dev ? (uint64_t) D * 4 : 0);
++        const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (need_mixed_h ? (uint64_t) N * 2 : 0ull) + (r_dev ? (uint64_t) D * 4 : 0);
++        const uint64_t xab = xa_bytes(s);
+         return (uint64_t) s * per + (uint64_t) lm_table_ints(s * K, G) * 4 + 4096 +
+-               (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256) + (fz ? (uint64_t) fused::act_bytes(s, N) + 256 : 0);
++               (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256) + (xab > 0 ? xab + 256 : 0);
+     };
+     size_t free_b = 0, total_b = 0;
+     cudaMemGetInfo(&free_b, &total_b);
+@@ -8260,8 +8302,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     m.lm.free_mib = (int64_t) (free_b >> 20);
+     auto fit = [&](bool r_dev) {   // the largest super-chunk (a multiple of the chunk) that fits `room`
+         int64_t s = S;
+-        while (s >= min_s && (int64_t) dev_bytes(s, r_dev) > room) s -= m.T;
+-        return s >= min_s ? s : (int64_t) 0;
++        while (s >= min_aligned && (int64_t) dev_bytes(s, r_dev) > room) s -= m.T;
++        return s >= min_aligned ? s : (int64_t) 0;
+     };
+     // a stage after the first: its rows arrive in R_host (the previous stage writes them there), so they stay there
+     const int mode = stage_lb_ > 0 ? 2 : lm_r_env();
+@@ -8277,7 +8319,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+         // the need side too, so a user can see how far off it is and free that much (--vram-reserve-mib,
+         // --vram-reserve-later-mib, a smaller --max-context): the smallest super-chunk fit() tried, in the cheaper of
+         // the row placements this mode allows, plus the margin kept free
+-        const int64_t s_min = S - (S - min_s) / m.T * m.T;
++        const int64_t s_min = S - (S - min_aligned) / m.T * m.T;
+         const int64_t margin = lm_margin_bytes(lm_by_default_);
+         const int64_t need_mib = ((int64_t) dev_bytes(s_min, mode == 1) + margin + (1 << 20) - 1) >> 20;
+         int dev = -1;
+@@ -8319,7 +8361,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     auto carve_b = [&](size_t b) { uint8_t* p = q; q += (b + 255) & ~(size_t) 255; return p; };
+     lb.mixed = (float*) carve_b((size_t) s_use * N * 4);
+     lb.acc = (float*) carve_b((size_t) s_use * N * 4);
+-    lb.mixed_h = (uint16_t*) carve_b((size_t) s_use * N * 2);
++    lb.mixed_h = need_mixed_h ? (uint16_t*) carve_b((size_t) s_use * N * 2) : nullptr;
+     lb.inj = (float*) carve_b((size_t) s_use * HC * 4);
+     lb.ids = (int32_t*) carve_b((size_t) s_use * K * 4);
+     lb.w = (float*) carve_b((size_t) s_use * K * 4);
+@@ -8327,7 +8369,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     lb.tab = (int32_t*) carve_b(tab * 4);
+     lb.tab_n = tab;
+     lb.R2 = r_dev ? nullptr : (float*) carve_b((size_t) m.T * D * 4);
+-    lb.xa = fz ? carve_b(fused::act_bytes(s_use, N)) : nullptr;
++    const uint64_t xab_use = xa_bytes(s_use);
++    lb.xa = xab_use > 0 ? carve_b((size_t) xab_use) : nullptr;
+     for (int b = 0; b < 2; ++b)
+         for (cudaEvent_t* e : {&lb.ev_in[b], &lb.ev_done[b], &lb.ev_out[b]})
+             if (*e == nullptr && cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) {
+@@ -8590,7 +8633,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+         const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
+         for (const int32_t e : strata::prefill::lm_streamed_experts(l, NEr, m.cache ? m.host_res : nullptr, [&](int64_t ll, int32_t ee) { return m.src->pinned(ll, ee); })) {
+             pf_job[(size_t) e] = (int) js.size();
+-            if (pdirect || m.src->transient(l, e)) {
++            if (pdirect || m.src->transient(l, e) || m.src->hybrid_direct_prefill()) {
+                 js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                 continue;
+             }
+@@ -8640,10 +8683,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+         const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
+         const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+         const bool fz_l = lb.xa != nullptr && lm_fused_layer(l, m.group_cap > 0);
++        const bool i8_l = !fz_l && !mmq_plan().layer[(size_t) l] && lb.xa != nullptr && m.i8_rec != nullptr &&
++                          m.ids_identity != nullptr && lm_i8_layer(l);
+         // a layer MMQ does not take runs run_impl's FP16 path (port, 2026-10-24): each expert dequantized to FP16 once
+         // per super-chunk, then per entry its rows' FP16 inputs (lb.mixed_h, the bits run_impl's gather reads) through
+         // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
+-        const bool fp16_l = !mmq_plan().layer[(size_t) l] && !fz_l;   // (fz_l without an MMQ layer: a build without MMQ, a layer of the plan's `fo` set)
++        const bool fp16_l = !mmq_plan().layer[(size_t) l] && !fz_l && !i8_l;   // (fz_l/i8_l without MMQ: own int8 kernels)
+         for (int32_t e = 0; e < NEr; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
+         // ---- the routed experts in id order (or GPUOS readiness-tier + row-count order when STRATA_MMQ_TIER_SORT=1 /
+         // STRATA_MMQ_RESIDENT_SORT_NE=1): resident ones from the cache, the others staged once (run_impl's walk)
+@@ -8676,7 +8721,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                 const int32_t e = uniq[u];
+                 if (resident(e) || m.src->pinned(l, e)) continue;
+                 job_of[u] = (int) js.size();
+-                if (pdirect || m.src->transient(l, e)) {
++                if (pdirect || m.src->transient(l, e) || m.src->hybrid_direct_prefill()) {
+                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                     continue;
+                 }
+@@ -8796,10 +8841,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+             return v == nullptr || std::atoi(v) != 0;
+         }();
+-        const bool group_lm = lm_group_env && !fz_l && !fp16_l && lay.native && MMQ_GROUP <= mmq::kGatherGroupMax;
+-        const bool need_grp = fz_l || group_lm;
+-        const int stage_n = need_grp ? STAGE_GRP : STAGE;
+-        const size_t ahead = fz_l ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : (size_t) STAGE - 1;
++        const bool group_lm = lm_group_env && !fz_l && !i8_l && !fp16_l && lay.native && MMQ_GROUP <= mmq::kGatherGroupMax;
++        const bool need_grp = fz_l || i8_l || group_lm;
++        const int stage_n = std::min(m.ring, need_grp ? STAGE_GRP : STAGE);
++        const size_t ahead = (fz_l || i8_l) ? (size_t) std::max(1, stage_n - MMQ_GROUP - 1) : (size_t) std::max(1, stage_n - 1);
+         int stage_next = 0;
+         auto stage_one = [&](size_t u) -> bool {
+             const int32_t e = uniq[u];
+@@ -8830,20 +8875,22 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+             lm_bytes += (uint64_t) lay.blob_bytes(l);
+             return true;
+         };
+-        const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, kFF2, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, kFF);
++        const size_t mmq_gub = (fp16_l || i8_l) ? 0 : mmq::matrix_bytes(mmq_gt, kFF2, N),
++                     mmq_db = (fp16_l || i8_l) ? 0 : mmq::matrix_bytes(mmq_dt, N, kFF);
+         const bool stream_ahead = stream_ahead_enabled();
+-        const size_t lookahead = group_lm ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : (fz_l ? ahead : (size_t) STAGE - 1);
+-        const size_t max_pending = group_lm ? (size_t) (STAGE_GRP - 4) : (size_t) STAGE;
++        const size_t lookahead = group_lm ? (size_t) std::max(1, stage_n - MMQ_GROUP - 1) : ((fz_l || i8_l) ? ahead : (size_t) std::max(1, stage_n - 1));
++        const size_t max_pending = (group_lm || i8_l) ? (size_t) std::max(1, stage_n - 4) : (size_t) stage_n;
+         size_t staged = 0, pending = 0, u = 0;
+         const uint8_t* blob_dev = nullptr;
+         size_t gi = 0;
+         int dq = -1;   // FP16 path: the dequant slot of the current expert
+-        // fused: the open group's expert pointers and the staged slots its launch gives back; the super-chunk's rows to int8 once per layer
++        // fused / i8_l: the open group's expert pointers and the staged slots its launch gives back; the super-chunk's rows to int8 once per layer
+         const uint8_t* fz_blob[MMQ_GROUP] = {};
+         int fz_rel[MMQ_GROUP] = {};
+         int fz_nrel = 0;
+         fused::NativeGeom fz_geom{};
+         bool lm_fp4 = false;
++        strata::kernels::NativeExpertLayout i8_L{};
+         if (fz_l) {
+             const auto& f = lay.fmt[(size_t) l];
+             fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+@@ -8851,6 +8898,11 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+             lm_fp4 = !f.had_gu && !f.had_d && f.gu_type == kTypeNvfp4Lm && f.d_type == kTypeNvfp4Lm && fp4_tc::wanted();
+             if (lm_fp4) fp4_tc::quantize_act(lb.mixed, Sn, N, lb.xa, cs);
+             else fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
++        } else if (i8_l) {
++            const auto& f = lay.fmt[(size_t) l];
++            i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
++            pt.mark(kPfGather, cs);
++            strata::kernels::native_expert_i8_quantize(lb.mixed, Sn, N, lb.xa, cs);
+         }
+         mmq::GatherGroup gg;
+         int gg_slots[MMQ_GROUP];
+@@ -8860,9 +8912,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+             const Grp& gp = grps[gi];
+             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
+                 if (j > 0) ++u;
+-                const size_t u1 = group_lm ? ent_u[gp.j1 - 1] + 1 : uniq.size();
++                const size_t u1 = (group_lm || i8_l) ? ent_u[gp.j1 - 1] + 1 : uniq.size();
+                 while (staged < uniq.size() &&
+-                       (fz_l ? (staged <= u + ahead)
++                       ((fz_l || i8_l) ? (staged <= u + ahead)
+                              : ((stream_ahead ? pending < max_pending : staged <= u + lookahead) &&
+                                 (staged < u1 || job_of[staged] < 0)))) {
+                     if (!stage_one(staged)) return false;
+@@ -8874,7 +8926,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                     ++stats_.experts_resident;
+                     ++lm_resident;
+                 } else {
+-                    if (!group_lm) {
++                    if (!group_lm && !i8_l) {
+                         pt.mark(kPfWaitCopy, cs);
+                         cudaStreamWaitEvent(cs, m.copied[stage_of[u]], 0);
+                     }
+@@ -8882,6 +8934,57 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                 }
+             }
+             const size_t q = j - gp.j0;
++            if (i8_l) {   // Phase 2 STRATA_LM_I8=1: OWN-I8 native_expert_i8 groups over the super-chunk
++                fz_blob[q] = blob_dev;
++                if (stage_of[u] >= 0) {
++                    gg_wait = stage_of[u];
++                    if (j == last_ent[u]) fz_rel[fz_nrel++] = stage_of[u];
++                }
++                if (j + 1 < gp.j1) continue;
++                const int ngx = (int) (gp.j1 - gp.j0);
++                if (gg_wait >= 0) {
++                    pt.mark(kPfWaitCopy, cs);
++                    cudaStreamWaitEvent(cs, m.copied[gg_wait], 0);
++                    gg_wait = -1;
++                }
++                pt.mark(kPfGemmGU, cs);
++                uint8_t rec_h[strata::prefill::i8grp::kRecBytes] = {};
++                for (int i = 0; i < ngx; ++i) {
++                    const unsigned long long ptr_u = (unsigned long long) (uintptr_t) fz_blob[i];
++                    std::memcpy(rec_h + 8 * (size_t) i, &ptr_u, 8);
++                    const int32_t s_off = ents[gp.j0 + (size_t) i].r0 - gp.r0;
++                    std::memcpy(rec_h + strata::prefill::i8grp::kRecStart + 4 * (size_t) i, &s_off, 4);
++                }
++                const int32_t s_end = gp.nr;
++                std::memcpy(rec_h + strata::prefill::i8grp::kRecStart + 4 * (size_t) ngx, &s_end, 4);
++                std::memcpy(rec_h + strata::prefill::i8grp::kRecN, &ngx, 4);
++                if (gp.nr <= 0 ||
++                    strata::kernels::native_expert_i8_scratch_bytes(gp.nr, ngx, i8_L.n_ff) > (size_t) G * (size_t) kFF2 * sizeof(float) ||
++                    !strata::kernels::native_expert_i8_put_record(m.i8_rec, rec_h, strata::prefill::i8grp::kRecBytes, cs)) {
++                    err = "prefill (layer-major i8): group launch record or scratch failed";
++                    return false;
++                }
++                strata::kernels::native_expert_i8(
++                    i8_L, (const unsigned long long*) m.i8_rec,
++                    (const int32_t*) (m.i8_rec + strata::prefill::i8grp::kRecStart),
++                    (const int32_t*) (m.i8_rec + strata::prefill::i8grp::kRecN),
++                    m.ids_identity, d_row_tok + gp.r0, ngx, gp.nr, lb.xa, (void*) m.GU, m.Dm, cs);
++                if (fz_nrel > 0) {
++                    const int rel = fz_rel[fz_nrel - 1];
++                    cudaEventRecord(m.used[rel], cs);
++                    for (int i = 0; i < fz_nrel; ++i) m.used_of[fz_rel[i]] = rel;
++                    pending -= (size_t) fz_nrel;
++                    fz_nrel = 0;
++                }
++                pt.mark(kPfCombine, cs);
++                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
++                                d_u_w + gp.r0, gp.nu, lb.acc, cs);
++                ++lm_groups;
++                ++lm_groups_fz;
++                ++gi;
++                core::progress_beat();
++                continue;
++            }
+             if (fp16_l) {
+                 pt.mark(kPfDequant, cs);
+                 if (j == 0 || ents[j - 1].e != e) {   // the expert's FP16 matrices, once (run_impl's dequant)
+@@ -9107,7 +9210,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                     }
+                 }
+                 m.mixed = lb.mixed + t0 * N;
+-                m.mixed_h = lb.mixed_h + t0 * N;   // the FFN half's FP16 rows stay for the layer's FP16 expert pass
++                m.mixed_h = lb.mixed_h ? (lb.mixed_h + t0 * N) : restore.mixed_h;   // reuse per-chunk FP16 buffer when no FP16 expert pass runs
+                 m.inj = lb.inj + t0 * HC;
+                 float* const acc = lb.acc + t0 * N;
+                 if (l == 0) {
+@@ -9660,8 +9763,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is off everywhere (sm120_series.hpp prefill_layer_major_default: a layer split
+     // reads 32K prompts 37-55% sooner chunk-major, owner's yes 2026-11-02; the single-card small-cache rule sets the variable itself)
+     if (hand_in_ == nullptr && impl_ &&
+-        strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
+-        const bool by_default = !lm_env_explicit();
++        (lm_i8_env() || strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026()))) {
++        const bool by_default = !lm_env_explicit() && !lm_i8_env();
+         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
+         std::string why;
+         if (by_default) {
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index 07a0caeda..dcedf0014 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -3536,6 +3536,48 @@ static void prime_hw_queues() {
+ }
+ #endif
+ 
++// Phase 2 opt-in helpers (all default OFF):
++// STRATA_ADAPT_COLD_CAP=N: cap SSD-cold (tier_of == 2) swaps per adapt round while allowing RAM-warm swaps freely.
++static int adapt_cold_cap_env() {
++    static const int cap = [] {
++        const char* v = std::getenv("STRATA_ADAPT_COLD_CAP");
++        return (v != nullptr && v[0] != '\0') ? std::max(0, std::atoi(v)) : 0;
++    }();
++    return cap;
++}
++
++// STRATA_MTP_ADAPT="max_t[,min_p_warm[,chain_p_warm[,cold_cpu_thr[,min_p_cold]]]]" (or "1" for defaults):
++// Cache/miss-aware adaptive MTP speculative window width + early draft stop (100% exact verification).
++struct MtpAdaptCfg {
++    bool on = false;
++    int max_t = 6;
++    float min_p_warm = 0.45f;
++    float chain_p_warm = 0.30f;
++    float cold_cpu_thr = 1.35f;
++    float min_p_cold = 0.55f;
++};
++static const MtpAdaptCfg& mtp_adapt_cfg() {
++    static const MtpAdaptCfg cfg = [] {
++        MtpAdaptCfg c;
++        const char* v = std::getenv("STRATA_MTP_ADAPT");
++        if (v != nullptr && v[0] != '\0' && v[0] != '0') {
++            int mt = 6;
++            float mpw = 0.45f, cpw = 0.30f, cct = 1.35f, mpc = 0.55f;
++            const int n = std::sscanf(v, "%d,%f,%f,%f,%f", &mt, &mpw, &cpw, &cct, &mpc);
++            if (n >= 1 && mt >= 1) {
++                c.on = true;
++                c.max_t = (n == 1 && mt == 1) ? 6 : std::max(2, std::min(mt, 8));
++                c.min_p_warm = std::max(0.05f, std::min(mpw, 0.99f));
++                c.chain_p_warm = std::max(0.01f, std::min(cpw, 0.99f));
++                c.cold_cpu_thr = std::max(0.05f, cct);
++                c.min_p_cold = std::max(0.05f, std::min(mpc, 0.99f));
++            }
++        }
++        return c;
++    }();
++    return cfg;
++}
++
+ // STRATA_SPEC_PROB=1 with the default (pick) gate: a draft that fails the confidence gate is still a proposal attempt, and the
+ // verifier gets the gated measure (core/gated_proposal.hpp).  That is exact only where the window choice cannot see a draw or a
+ // timing that the next rounds draw again.  Where it cannot be kept, say why and return false: the caller keeps the older rule
+@@ -15399,7 +15441,23 @@ int main(int argc, char** argv) {
+                 }
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
++            if (const int cold_cap = adapt_cold_cap_env(); cold_cap > 0 && !swaps.empty()) {
++                std::vector<Swap> kept;
++                kept.reserve((size_t) std::min<int>((int) swaps.size(), o.adapt_swaps));
++                int cold_used = 0;
++                for (const Swap& s : swaps) {
++                    if ((int) kept.size() >= o.adapt_swaps) break;
++                    const int tier = src.tier_of(s.layer, s.in);
++                    if (tier >= 2) {
++                        if (cold_used >= cold_cap) continue;
++                        ++cold_used;
++                    }
++                    kept.push_back(s);
++                }
++                swaps.swap(kept);
++            } else if ((int) swaps.size() > o.adapt_swaps) {
++                swaps.resize((size_t) o.adapt_swaps);
++            }
+             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
+                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
+                 agate.landed.store(-1, std::memory_order_release);
+@@ -16440,6 +16498,11 @@ int main(int argc, char** argv) {
+         static const bool draft_keep_off = std::getenv("STRATA_DRAFT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DRAFT_KEEP")) == 0;   // diagnostic: do not keep the idle drafter current
+         int64_t draft_req_count = 0;
+         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
++        const MtpAdaptCfg& mtp_adapt = mtp_adapt_cfg();
++        const bool mtp_adapt_on = !spec_cost && mtp_adapt.on && use_mtp;
++        float mtp_ema_cpu = 2.0f;
++        float mtp_chain_q = 1.0f;
++        int mtp_adapt_rows = 1;
+         strata::spec::DraftPolicy::ChainState chain_st;
+         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
+         policy.set_robust(spec_cost);
+@@ -16449,6 +16512,18 @@ int main(int argc, char** argv) {
+                 chain_rows = chain_st.best_rows;
+                 return k;
+             });
++        else if (mtp_adapt_on)
++            mtp.set_chain_rule([&](int idx, float pj) -> bool {
++                if (idx == 0) { mtp_chain_q = 1.0f; mtp_adapt_rows = 1; }
++                mtp_chain_q *= pj;
++                const bool warm = mtp_ema_cpu <= mtp_adapt.cold_cpu_thr;
++                const int eff_cap = std::min(S_mtp, warm ? mtp_adapt.max_t : std::min(mtp_adapt.max_t, 4));
++                const float p_thr = warm ? mtp_adapt.min_p_warm : mtp_adapt.min_p_cold;
++                const float q_thr = warm ? mtp_adapt.chain_p_warm : (mtp_adapt.min_p_cold * mtp_adapt.min_p_cold);
++                if (pj < p_thr || (idx > 0 && mtp_chain_q < q_thr)) return false;
++                if (idx + 2 <= eff_cap) mtp_adapt_rows = idx + 2;
++                return (idx + 2 < eff_cap);
++            });
+         policy.set_sizes(lookup_size_mask(o));
+         // a layer split's hand-off buffers hold kVerifyNarrowT rows: its windows stay at that
+         if (n_stages > 1) policy.set_sizes(policy.sizes() & ((2u << strata::kernels::kVerifyNarrowT) - 1u));
+@@ -21449,7 +21524,7 @@ int main(int argc, char** argv) {
+             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+             const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+                 gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && n_stages == 1 && !multi_gpu && drive.d.remote_count == 0,
+-                                      o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0 || o.pcie_frac_auto, spec_cost || req_df2, S,
++                                      o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0 || o.pcie_frac_auto, spec_cost || mtp_adapt_on || req_df2, S,
+                                       req_spec_min_p);
+             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
+                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
+@@ -21665,6 +21740,14 @@ int main(int argc, char** argv) {
+             }
+             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+             const double read_pass_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
++            std::vector<uint32_t> rsm_warm_bits;
++            auto refresh_rsm_warm = [&] {
++                if (!strata::core::Verifier::route_smart_v2_on()) return;
++                rsm_warm_bits.assign((size_t) g.n_layers * (size_t) ((g.n_expert + 31) / 32), 0u);
++                if (srcp->scan_warm_bitmap(rsm_warm_bits.data(), g.n_layers, g.n_expert))
++                    (void) ver.update_warm_bitmap(rsm_warm_bits.data(), rsm_warm_bits.size());
++            };
++            refresh_rsm_warm();
+             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+             std::fflush(stdout);
+             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
+@@ -22726,8 +22809,8 @@ int main(int argc, char** argv) {
+                     {   // the window rule of this request's ACTIVE source (spec/window_rule.hpp), as in the CLI loop: the MTP chain's cost rule
+                         // and probabilities do not govern DFlash2's candidates, though the MTP may stay loaded beside it
+                         strata::spec::WindowRuleIn wr;
+-                        wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = req_df2; wr.spec_cost = spec_cost; wr.first_window = first_window;
+-                        wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = req_spec_min_p;
++                        wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = req_df2; wr.spec_cost = spec_cost || mtp_adapt_on; wr.first_window = first_window;
++                        wr.chain_rows = spec_cost ? chain_rows : mtp_adapt_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = req_spec_min_p;
+                         wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
+                         T = strata::spec::choose_window(wr);
+                     }
+@@ -23170,6 +23253,12 @@ int main(int argc, char** argv) {
+                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                     ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
++                    if (mtp_adapt_on && !initial_round && !merged) {
++                        const float cur_ce = (float) drive.d.experts / (float) std::max<int64_t>(1, g.n_layers);
++                        const float alpha = cur_ce > mtp_ema_cpu ? 0.40f : 0.25f;
++                        mtp_ema_cpu = (1.0f - alpha) * mtp_ema_cpu + alpha * cur_ce;
++                    }
++                    if (rounds > 0 && (rounds % 256) == 0) refresh_rsm_warm();
+                 }
+                 pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
+                 if (adapt_thr.joinable()) {
+@@ -24773,7 +24862,23 @@ int main(int argc, char** argv) {
+                 }
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
++            if (const int cold_cap = adapt_cold_cap_env(); cold_cap > 0 && !swaps.empty()) {
++                std::vector<Swap> kept;
++                kept.reserve((size_t) std::min<int>((int) swaps.size(), o.adapt_swaps));
++                int cold_used = 0;
++                for (const Swap& s : swaps) {
++                    if ((int) kept.size() >= o.adapt_swaps) break;
++                    const int tier = src.tier_of(s.layer, s.in);
++                    if (tier >= 2) {
++                        if (cold_used >= cold_cap) continue;
++                        ++cold_used;
++                    }
++                    kept.push_back(s);
++                }
++                swaps.swap(kept);
++            } else if ((int) swaps.size() > o.adapt_swaps) {
++                swaps.resize((size_t) o.adapt_swaps);
++            }
+             // this (non-serve) path refills CUDA0's cache only, so its copies back read CUDA0's cache too
+             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,
+                                       [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
+@@ -24856,6 +24961,11 @@ int main(int argc, char** argv) {
+         // STRATA_SPEC_COST=1 (A/B arm, bench): the MTP window by expected tokens per ms at this machine's measured row costs
+         // (DraftPolicy::keep_draft, step by step) instead of "draft probability >= --spec-min-p"
+         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();
++        const MtpAdaptCfg& mtp_adapt = mtp_adapt_cfg();
++        const bool mtp_adapt_on = !spec_cost && mtp_adapt.on && use_mtp;
++        float mtp_ema_cpu = 2.0f;
++        float mtp_chain_q = 1.0f;
++        int mtp_adapt_rows = 1;
+         std::vector<float> dwin((size_t) o.spec, 0.0f);   // the draft probabilities this round's window was chosen from
+         std::FILE* spec_trace = nullptr;
+         if (const char* tf = std::getenv("STRATA_SPEC_TRACE"); tf != nullptr && tf[0] != '\0') spec_trace = std::fopen(tf, "w");
+@@ -24873,7 +24983,7 @@ int main(int argc, char** argv) {
+         const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+             gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && !multi_gpu && drive.d.remote_count == 0,
+                                   o.lookup_chain, o.adapt_swaps, o.pcie_frac != 0.0 || o.pcie_frac_auto,
+-                                  spec_cost || spec_uses_df2 || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
++                                  spec_cost || mtp_adapt_on || spec_uses_df2 || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
+         if (gated_proposal && !follow.empty())
+             std::fprintf(stderr, "strata generate: --spec-follow replaces outputs before acceptance (teacher-forced diagnostic, not sampling-law evidence)\n");
+         strata::core::MtpDrafter::DraftResult generation;
+@@ -24925,6 +25035,26 @@ int main(int argc, char** argv) {
+                 chain_rows = chain_st.best_rows;
+                 return k;
+             });
++        else if (mtp_adapt_on)
++            mtp.set_chain_rule([&](int idx, float pj) -> bool {
++                if (idx == 0) { mtp_chain_q = 1.0f; mtp_adapt_rows = 1; }
++                mtp_chain_q *= pj;
++                const bool warm = mtp_ema_cpu <= mtp_adapt.cold_cpu_thr;
++                const int eff_cap = std::min(S_mtp, warm ? mtp_adapt.max_t : std::min(mtp_adapt.max_t, 4));
++                const float p_thr = warm ? mtp_adapt.min_p_warm : mtp_adapt.min_p_cold;
++                const float q_thr = warm ? mtp_adapt.chain_p_warm : (mtp_adapt.min_p_cold * mtp_adapt.min_p_cold);
++                if (pj < p_thr || (idx > 0 && mtp_chain_q < q_thr)) return false;
++                if (idx + 2 <= eff_cap) mtp_adapt_rows = idx + 2;
++                return (idx + 2 < eff_cap);
++            });
++        std::vector<uint32_t> rsm_warm_bits;
++        auto refresh_rsm_warm = [&] {
++            if (!strata::core::Verifier::route_smart_v2_on()) return;
++            rsm_warm_bits.assign((size_t) g.n_layers * (size_t) ((g.n_expert + 31) / 32), 0u);
++            if (srcp->scan_warm_bitmap(rsm_warm_bits.data(), g.n_layers, g.n_expert))
++                (void) ver.update_warm_bitmap(rsm_warm_bits.data(), rsm_warm_bits.size());
++        };
++        refresh_rsm_warm();
+         policy.set_sizes(lookup_size_mask(o));
+         std::vector<int32_t> sbuf((size_t) o.spec, 0);
+         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+@@ -25063,8 +25193,8 @@ int main(int argc, char** argv) {
+             {   // the window rule of the round's ACTIVE source (spec/window_rule.hpp): the MTP chain's cost rule and probabilities do not
+                 // govern DFlash2's candidates, though the MTP may stay loaded beside it as the fallback (use_mtp)
+                 strata::spec::WindowRuleIn wr;
+-                wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = spec_uses_df2; wr.spec_cost = spec_cost; wr.first_window = first_window;
+-                wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = o.spec_min_p;
++                wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = spec_uses_df2; wr.spec_cost = spec_cost || mtp_adapt_on; wr.first_window = first_window;
++                wr.chain_rows = spec_cost ? chain_rows : mtp_adapt_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = o.spec_min_p;
+                 wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
+                 T = strata::spec::choose_window(wr);
+             }
+@@ -25259,6 +25389,12 @@ int main(int argc, char** argv) {
+             p += a + 1;
+             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+             total_ms += round_ms;
++            if (mtp_adapt_on && !initial_round) {
++                const float cur_ce = (float) drive.d.experts / (float) std::max<int64_t>(1, g.n_layers);
++                const float alpha = cur_ce > mtp_ema_cpu ? 0.40f : 0.25f;
++                mtp_ema_cpu = (1.0f - alpha) * mtp_ema_cpu + alpha * cur_ce;
++            }
++            if (rounds > 0 && (rounds % 256) == 0) refresh_rsm_warm();
+             if (gated_proposal && !initial_round) source_policy.observe_committed(from_sfx, from_sfx ? T : std::min(S_mtp, room), a, sfx_match);
+             if (gated_proposal && !initial_round && timed_round)   // p has advanced: the window was p - a - 1 ..
+                 source_policy.defer_cost(std::max<int64_t>(p - a - 2 + T, p + S_mtp), T, round_ms);
+-- 
+2.55.0
+

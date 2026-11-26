@@ -6,13 +6,17 @@
 
 **이 기계의 결과:** 처음 읽는 9.7K~119K 프롬프트의 프리필 약 1,200~1,300 tok/s, 짧은 후속 요청의 디코드 50~64 tok/s, 컨텍스트 256K, 이미지 입력 켬. 같은 기계의 시작점은 프리필 382~414 tok/s(9.7K), 디코드 26~37 tok/s였다.
 
+> **2026-11-26 v2 업데이트 (Strata `2af30ccaa` / v0.2.21.1 기반):** opt-in Phase 1·2 RDNA2 + Zen 4 패치([`patches/v2/`](patches/v2/README.md), [`results/v2-phase1-2.md`](results/v2-phase1-2.md))로 웜 4K~16K 디코드를 **89~101 tok/s**(`P1_MTP6`, 기존 고정 `v0.2.16` 4K 중앙값 `35.3 tok/s`)까지 끌어올리고, 매칭 16K 직접 SSD 읽기량을 **-55.5%**(`53.97 → 23.99 GiB`, `STRATA_LM_I8=1`) 줄였다. 품질 보강형 `P2_CAL`(보류 808토큰 추가 NLL **-66.1%**, 엄격 `finish_reason=="stop"` **8/8 통과**), 비트 동일 Zen 4 AVX-512 IQ Gate/Up(`STRATA_IQ512_EXACT_GU=1`), fail-closed `O_DIRECT` 오류 처리 및 실시간 NVMe 워치독([`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py))을 포함한다.
+
 | | |
 |---|---|
 | [`hardware.md`](hardware.md) | 기계 사양, ROCm, 엔진 빌드 옵션 |
-| [`results/`](results/README.md) | 바꾼 것마다의 측정 효과, VRAM 분해, 실제 요청 분포 |
-| [`rejected.md`](rejected.md) | 이 하드웨어에서 시도했다가 손해 본 것 |
-| [`config/engine.example.json`](config/engine.example.json) | 경로를 자리표시자로 바꾼 서버 설정 |
-| [`patches/`](patches/README.md) | Strata v0.1.42용 엔진 패치 5개(그중 3개는 본가 PR 백포트)와 서버 패치 |
+| [`results/`](results/README.md) | 기존 v0.1.42 측정 효과, VRAM 분해, 실제 요청 분포 |
+| [`results/v2-phase1-2.md`](results/v2-phase1-2.md) | **2026-11-26 v2:** 독립 감사 거친 Phase 1·2 ABBA, 16K `LM_I8` I/O, 808토큰 PPL, 엄격 8/8 품질, AVX-512 통합, 저장장치 안전화 |
+| [`rejected.md`](rejected.md) | 이 하드웨어에서 시도했다가 손해 본 것 (2026-11-26 보강) |
+| [`config/`](config/engine.v2-p1-mtp6.example.json) | 자리표시자 서버 설정 (`engine.example.json` v0.1.42; `engine.v2-p1-mtp6.example.json`, `engine.v2-p2-cal.example.json` v2) |
+| [`patches/`](patches/README.md) | v0.1.42 패치(`patches/engine/`, `patches/serve/`) 및 **`2af30ccaa`용 v2 opt-in 패치**([`patches/v2/`](patches/v2/README.md)) |
+| [`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py) | 읽기 전용 sysfs 실시간 NVMe 상태·온도 워치독 및 단위 테스트(`test_nvme_watchdog.py`) |
 
 관련 자료: 같은 PC에서 잰 연산 단위 측정은 [RDNA2 gfx1030 AI 최적화 핸드북](https://github.com/unixyo/rdna2-gfx1030-ai-handbook)에 있다. 핸드북 §9.18은 이 레시피 위에서 한 Strata 프리필 후속 연구(typical-J 타일, warm 병목)이고, 이 레시피의 설정을 바꾸지 않는다.
 
