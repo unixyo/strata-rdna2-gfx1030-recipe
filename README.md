@@ -44,6 +44,13 @@ Related: the [RDNA2 gfx1030 AI optimization handbook](https://github.com/unixyo/
 - Engine base is v0.1.42; upstream has moved on (v0.2.8 at the time of writing). Some of this may already be upstream or no longer apply.
 - Answer quality at IQ3_XXS, k8v4 and 256K has not been measured end to end.
 
+## Acknowledgments
+
+- Direction, local hardware operation, and final verification: repository owner.
+- Long-horizon RDNA2/Zen4 kernel exploration and `v2`/`v3` patch authoring: **GPT Pro**.
+- Initial `v0.1.42` recipe curation, cross-checks, and documentation: **Claude**.
+- `v2`/`v3` live ABBA benchmarking, `gfx1030` `DFlash2` tuning (`STRATA_DF2_GEMM4=15` and 2-track evaluation), NVMe/PCIe PM mitigation, and repository packaging: **Gemini**.
+
 ## License
 
 MIT. The patches are derived from Strata (MIT, Niko1221 and the Strata contributors). Patches 0002, 0003 and 0005 backport Strata PRs #1151, #1167 and #3381 by @Vop3p; the credit for those changes is theirs.
