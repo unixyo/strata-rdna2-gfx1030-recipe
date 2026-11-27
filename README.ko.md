@@ -6,16 +6,19 @@
 
 **이 기계의 결과:** 처음 읽는 9.7K~119K 프롬프트의 프리필 약 1,200~1,300 tok/s, 짧은 후속 요청의 디코드 50~64 tok/s, 컨텍스트 256K, 이미지 입력 켬. 같은 기계의 시작점은 프리필 382~414 tok/s(9.7K), 디코드 26~37 tok/s였다.
 
+> **2026-11-27 v3 업데이트 (`patches/v2/0005-v3-rdna2-zen4-exact-kernels.patch`, [`results/v3-exact-kernels.md`](results/v3-exact-kernels.md)):** opt-in exact RDNA2·Zen 4 커널 6종(`STRATA_GDN_RDNA2=2`, `STRATA_QSA_RDNA2_LDS=1`, `STRATA_MMVQ_RDNA2_ROWS=1`, `STRATA_IQ512_EXACT_DOWN=1`, `STRATA_I8_RDNA2_SINGLE=1`, `STRATA_EXP_MODE=10`)을 `STRATA_IQ512_EXACT_GU=1`과 결합했다(CTest 28/28, settings 8/8, Metal `stubs_neon.cpp` strict syntax PASS). 전용 PCIe Gen4 NVMe(`--vram-reserve-mib 896`, `LM_I8` ON, 텍스트 전용) 웜 대칭 ABBA에서 무근사 **`EXACT_V3`** 는 `short`/`4k_r1`/`4k_r2` 디코드 **`56.8~68.3 tok/s`**(`EXACT_V2` 대비 **`+10.4%~+14.8%`**, 최고 **`69.19 tok/s`**, 프리필 `-2.1%~-14.8%`)까지 올라갔고, 근사 라우팅 **`MTP6_V3`** 는 매칭 구간 디코드 `+2.2%~+4.1%` 및 16K 프리필 `-2.2%`(최고 **`98.76 tok/s` / `15.60 s`**; `4k_r2`는 MTP 채택률 분산 범위)를 기록했다.
+>
 > **2026-11-26 v2 업데이트 (Strata `2af30ccaa` / v0.2.21.1 커스텀 패치 빌드):** opt-in Phase 1·2 RDNA2 패치([`patches/v2/`](patches/v2/README.md), [`results/v2-phase1-2.md`](results/v2-phase1-2.md); 비표준 텍스트 전용, `n=1~2`) 기준 웜 4K~16K 디코드는 근사 라우팅 OFF(`EXACT_P2` routing-off 기준) **50~59 tok/s**, 근사 라우팅 ON(`P1_MTP6`, 출력 변경 `STRATA_ROUTE_SMART`) **89~101 tok/s**다. 매칭 16K 직접 SSD 읽기량은 **-55.5%**(`53.97 → 23.99 GiB`, 시간 `-11.4%` / 처리량 `+12.9%`, `STRATA_LM_I8=1`) 줄였고, 드리프트 완화형 `P2_CAL`(808토큰 1세트 기준 `SMART v1` 대비 추가 NLL `-66.1%`, 8태스크 채점 + `finish_reason=="stop"` 8/8), CPU 컴포넌트 검증 완료 Zen 4 AVX-512 exact IQ Gate/Up 패치(`STRATA_IQ512_EXACT_GU=1`, E2E 표 미포함), fail-closed `O_DIRECT` 오류 처리 및 읽기 전용 NVMe 워치독([`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py))을 포함한다.
 
 | | |
 |---|---|
 | [`hardware.md`](hardware.md) | 기계 사양, ROCm, 엔진 빌드 옵션 |
 | [`results/`](results/README.md) | 기존 v0.1.42 측정 효과, VRAM 분해, 실제 요청 분포 |
+| [`results/v3-exact-kernels.md`](results/v3-exact-kernels.md) | **2026-11-27 v3:** 신규 exact RDNA2·Zen 4 커널 6종(`0005`), 단위 검증, Gen4 NVMe 웜 ABBA(`EXACT_V3` +10~15%, `MTP6_V3`), 리눅스 NVMe/PCIe 절전 메모 |
 | [`results/v2-phase1-2.md`](results/v2-phase1-2.md) | **2026-11-26 v2:** 커스텀 빌드 Phase 1·2 ABBA(`n=1~2`), 16K `LM_I8` I/O, 808토큰 드리프트·8태스크 완료 점검, CPU 전용 AVX-512 검증, 저장장치 완화 조치 |
-| [`rejected.md`](rejected.md) | 이 하드웨어에서 시도했다가 손해 본 것 (2026-11-26 보강) |
-| [`config/`](config/engine.v2-p1-mtp6.example.json) | 자리표시자 서버 설정 (`engine.example.json` v0.1.42; 실사용 예시 `engine.v2-p1-mtp6.example.json`, `engine.v2-p2-cal.example.json` — `results/v2-phase1-2.md` 주석 참고) |
-| [`patches/`](patches/README.md) | v0.1.42 패치(`patches/engine/`, `patches/serve/`) 및 **`2af30ccaa`용 v2 opt-in 패치**([`patches/v2/`](patches/v2/README.md)) |
+| [`rejected.md`](rejected.md) | 이 하드웨어에서 시도했다가 손해 본 것 (2026-11-27 보강) |
+| [`config/`](config/engine.v3-exact.example.json) | 자리표시자 서버 설정 (`engine.example.json` v0.1.42; `engine.v2-p1-mtp6.example.json`, `engine.v2-p2-cal.example.json` v2; **`engine.v3-exact.example.json` v3**) |
+| [`patches/`](patches/README.md) | v0.1.42 패치(`patches/engine/`, `patches/serve/`) 및 **`2af30ccaa`용 v2·v3 opt-in 패치**([`patches/v2/`](patches/v2/README.md)) |
 | [`scripts/nvme_watchdog.py`](scripts/nvme_watchdog.py) | 읽기 전용 sysfs 실시간 NVMe 상태·온도 워치독 및 단위 테스트(`test_nvme_watchdog.py`) |
 
 관련 자료: 같은 PC에서 잰 연산 단위 측정은 [RDNA2 gfx1030 AI 최적화 핸드북](https://github.com/unixyo/rdna2-gfx1030-ai-handbook)에 있다. 핸드북 §9.18은 이 레시피 위에서 한 Strata 프리필 후속 연구(typical-J 타일, warm 병목)이고, 이 레시피의 설정을 바꾸지 않는다.

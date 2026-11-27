@@ -30,3 +30,12 @@ General lesson for this machine: any setting that takes more RAM away from the p
 | `STRATA_PF_DIRECT_HYBRID=1` at 12 stager threads | Sustained ~6.89 GB/s scanning coincided with a KIOXIA EXCERIA PRO NVMe controller drop (`CSTS=0xffffffff`, `-19 ENODEV`). Lowered default to **4 threads** (`6,598 MB/s` = 95.8% peak, 1/3 queue depth), made `copy_blob_hybrid`/`Prefill::Stager` **fail-closed** on `EIO`/`ENODEV`/`ENXIO`, added continuous read-only sysfs watchdog (`scripts/nvme_watchdog.py`), and removed swap from the model SSD. |
 | `STRATA_LM_I8=1` with `--spec 6`, `--vision`, and `--vram-reserve-mib 768` | Left `736 MiB` free VRAM after graph capture (50 MiB short of the `786 MiB` 16K super-chunk threshold), silently falling back to chunk-major. Raising to `--vram-reserve-mib 896` leaves `874 MiB` free and reliably activates `LM_I8` (with `--vision` OFF, `768` left `888 MiB` free). |
 | `STRATA_IQ4NL_PAIR_ROWS=1` (CPU IQ4_NL down two-row; experimental, not in `patches/v2/`) | Bit-exact, but multi-core 7-worker pool A/B regressed down-phase time by **+5.99% slower** (`1.852 -> 1.963 ms`). Not adopted. |
+
+## 2026-11-27 additions (Strata v3 exact-kernel study)
+
+| What | Result |
+|---|---|
+| QSA paired-score attention candidate | Bit-exact, but regressed `n_q=256` to **0.866×** (resident) / **0.822×** (masked). Removed from production flags (diagnostic only). |
+| OWN-I8 `64×64` smaller tile (`STRATA_I8_TM=9`) | Raised queried occupancy `1 → 2`, but lost data reuse / arithmetic intensity and ran **19.45–26.52% slower**. Replaced by `STRATA_I8_RDNA2_SINGLE=1` (keeps `128×128` tile, halves LDS buffers). |
+| `STRATA_I8_RDNA2_SINGLE=1` combined with `STRATA_I8_RDNA2=1` | On large 128-group cache-exceeding weights (`IQ3_XXS / Q2_0`), enabling both regressed by **-2.21%** (`0.9784×`). Keep `STRATA_I8_RDNA2=0` when enabling `STRATA_I8_RDNA2_SINGLE=1`. |
+| Unconditional `STRATA_EXP_MODE=10` `TN=1` / global `STRATA_NO_MMVQ_ROWS2` | `TN=1` regressed `2+`-entry groups to **0.45–0.79×** (restricted to `max_group_entries==1` supported pairs); global 1-row MMVQ regressed `Q8_0` out / `Q3` projections and large `Q6_K` `NC=5` (restricted to measured `Q6_K` `K=2560` geometries). |
