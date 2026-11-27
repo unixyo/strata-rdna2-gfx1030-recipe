@@ -68,3 +68,37 @@ During v3 live testing on Linux 7.3 with a Phison E18 NVMe (`KIOXIA EXCERIA PRO`
 Two mitigations were verified on the same host:
 1. Adding all three kernel boot parameters (`nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off`, forcing root-port `power/control=on` and NVMe `pm_qos=0`) allowed the same KIOXIA drive (Gen3) to complete a full 4-arm `EXACT` ABBA (`133.22 GiB` read, max `40.9°C`, `0` kernel warnings; background writer closed).
 2. Moving the `112.32 GiB` model pack to the second CPU-direct Gen4 x4 NVMe (`WD_BLACK SN850X` with tall heatsink in `M2_2`) eliminated all KIOXIA I/O and completed 9 consecutive arms (`254.06 GiB` read, max `41.9°C`, `0` errors).
+
+---
+
+## 4. DFlash2 vs MTP6 2-Track Evaluation on RX 6900 XT (`gfx1030`)
+
+Evaluated `incoai/Qwen3.8-Flash-Next-DFlash2` (`q4_0-selq4.pack`, `339.7 MB`, `--draft-fallback none` so the MTP layer is unloaded) on the same v3 binary + `SMART v1` + SN850X Gen4 (`--vram-reserve-mib 896`, text-only).
+
+### 4.1 `gfx1030` Q4_0 GEMM Variant Sweep (`dflash2_gemm_bench`)
+In `engine/src/kernels/cuda/dflash2.cu`, `df2_q4_auto()` only dispatches RDNA3/4 (`gfx11`/`gfx12`) to variants `26`/`31` and falls back to NVIDIA `sm_120` variant `17` on `gfx1030`. Sweeping all 8 DFlash2 shapes across `STRATA_DF2_GEMM4=10..45` (all bitwise identical):
+- Default `v17`: `1,130.9 µs` (`1.131 ms`) weighted 5-layer step; RDNA3/4 `v26`: `1,125.9 µs`.
+- **Best single global `gfx1030` setting: `STRATA_DF2_GEMM4=15` (`1,047.9 µs` / `1.08×`)** (small matrices `akp`/`sel` reach `1.8–2.0×` at `v20`/`v33`, `9.9 → 5.0 µs`).
+- **VRAM benefit:** DFlash2 `selq4` uses `521 + 110 = 631 MiB` vs MTP `Q2_0 S2` `826 + 110 = 936 MiB` (**`~305 MiB` saved → `5,868 → 6,023` expert cache slots, `+155` slots**; HIP graphs captured in `44–45 ms`).
+
+### 4.2 3-Way 2-Track ABBA: No-Drafter vs `MTP6` vs `DFlash2` (`--spec 6 --draft-conf 0.5`)
+To avoid low-entropy greedy bias, we tested both **Track A** (greedy `temp=0.0`, coding/structured/technical) and **Track B** (real-use sampling `temp=1.0, top_p=0.95, top_k=20`, open-ended English creative fiction, casual brainstorming chat, and conversational opinion essay). Symmetric `BAAB` (`DF2, MTP6, MTP6, DF2`, `n = 2` per arm) alongside `n = 2` no-drafter reference (`6,458` slots):
+
+| Case | No Drafter (`6,458 sl`) | `MTP6` (`5,868 sl`) | `DFlash2 (6 / 0.5)` (`6,023 sl`) | `DFlash2` vs `MTP6` |
+|---|---:|---:|---:|---:|
+| `[A] A_short_tech` (`temp=0.0`) | `55.34 tok/s` | `79.36` (`2.02t / 25.4 ms`) | **`80.30`** (`2.11t / 26.3 ms`) | **`+1.18%`** |
+| `[A] A_4k_struct` (`temp=0.0`) | `59.05 tok/s` | `82.15` (`2.33t / 28.3 ms`) | **`86.22`** (`2.50t / 28.9 ms`) | **`+4.96%`** |
+| `[A] A_code_py` (`temp=0.0`, asyncio) | `56.41 tok/s` | `89.00` (`2.44t / 27.4 ms`) | **`101.17`** (`3.06t / 30.3 ms`, peak **`105.89`**) | **`+13.67%`** |
+| `[B] B_creative_story` (`temp=1.0`) | `55.53 tok/s` | **`72.00`** (`1.98t / 27.5 ms`) | `68.75` (`1.88t / 27.3 ms`) | `-4.51%` (`MTP6` wins) |
+| `[B] B_open_chat` (`temp=1.0`) | `56.85 tok/s` | **`70.44`** (`1.67t / 23.7 ms`) | `66.30` (`1.60t / 24.1 ms`) | `-5.88%` (`MTP6` wins) |
+| `[B] B_opinion_essay` (`temp=1.0`) | `58.62 tok/s` | `74.38` (`1.84t / 24.8 ms`) | **`82.35`** (`2.12t / 25.8 ms`) | **`+10.71%`** |
+| **Track A Mean (Greedy)** | `56.94 tok/s` | `83.50 tok/s` | **`89.23 tok/s`** | **`+6.86%`** (`1.57×` vs OFF) |
+| **Track B Mean (`temp=1.0` Chat)** | `57.00 tok/s` | `72.27 tok/s` | **`72.47 tok/s`** | **`+0.27%`** (`1.27×` vs OFF) |
+
+### 4.3 `DFlash2` Window Sweep (`spec / draft-conf`, `n = 1` per cell)
+- **`spec 6 / conf 0.50`** (`79.24 tok/s` 6-case mean; Track A `85.85`, Track B `72.63`) — **best overall on 16 GB offloading**.
+- **`spec 8 / conf 0.50`** (`78.85 tok/s`; Track A `85.95`, Track B `71.75`) — essentially tied, slight edge on coding (`94.85` vs `92.47`).
+- **`spec 8 / conf 0.35`** (`77.47 tok/s`; Track A `84.83`, Track B `70.10`) — pushed `A_4k_struct` to `3.05 tok/step` (`89.01 tok/s`), but raised step latency by `+2 to +5 ms` (`29.0 → 34.3 ms/step`) and dropped acceptance to `0.40–0.62`, hurting overall throughput.
+
+**Takeaway:** Even on an abliterated target checkpoint, `DFlash2` (`--spec 6 --draft-conf 0.5`, `STRATA_DF2_GEMM4=15`) clearly beats `MTP6` on coding (`+13.7%`), structured 4K (`+5.0%`), and expository prose (`+10.7%`) while freeing `~305 MiB` VRAM (`+155` slots), whereas autoregressive `MTP6` remains faster (`+4.5% to +5.9%`) on high-entropy creative fiction and casual chat at `temp=1.0`.
+
